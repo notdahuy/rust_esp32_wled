@@ -7,7 +7,7 @@ use std::time::Duration;
 
 /// Update LED với trạng thái hiện tại
 pub fn update_leds(driver: &Arc<Mutex<Ws2812Esp32RmtDriver>>, state: &LedState) -> Result<(), anyhow::Error> {
-    let final_color = state.get_final_color();
+    let final_color = state.get_static_color();
     let pixels: Vec<RGB8> = vec![final_color; LED_COUNT];
     let pixel_bytes: Vec<u8> = pixels.iter()
         .flat_map(|pixel| [pixel.g, pixel.r, pixel.b])
