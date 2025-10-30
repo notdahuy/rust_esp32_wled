@@ -14,7 +14,7 @@ pub enum EffectType {
     Rainbow,
     Blink,
     BlinkRainbow,     
-    Aurora,
+    TheaterChase,
     Meteor,
     ColorWipe,
     Off,            
@@ -30,6 +30,7 @@ pub struct LedController<'a> {
     tick: u64,
     last_update: u64,
     frame_interval: u64,
+    time: f32,
     audio_processor: Option<Arc<AudioProcessor>>,
     prev_frame: Vec<RGB8>,
     needs_update: bool,
@@ -46,7 +47,8 @@ impl<'a> LedController<'a> {
             speed: 128,
             tick: 0,
             last_update: 0,
-            frame_interval: 33_333,
+            frame_interval: 6_944,
+            time: 0.0,
             audio_processor: None,
             prev_frame: vec![RGB8 { r: 0, g: 0, b: 0 }; num_leds],
             needs_update: true, 
@@ -61,13 +63,17 @@ impl<'a> LedController<'a> {
         let new_level = level.clamp(0.0, 1.0);
         
         if (self.brightness - new_level).abs() > 0.001 {
+            log::info!("Brightness changed: {} -> {}", self.brightness, new_level);
             self.brightness = new_level;
             self.needs_update = true; 
         }
     }
 
-    pub fn set_color(&mut self, color: RGB8) {
-        self.color = color
+    pub fn set_color(&mut self, color: RGB8) {   
+        if self.color != color {
+            self.color = color;
+            self.needs_update = true;
+        }
     }
 
     pub fn set_effect(&mut self, effect: EffectType) {
@@ -77,52 +83,61 @@ impl<'a> LedController<'a> {
     }
 
     pub fn set_speed(&mut self, speed: u8) {
+        let old_speed = self.speed;
         self.speed = speed.clamp(1, 255);
+        
+        if old_speed != self.speed {
+            // Reset tick khi speed thay đổi để effect bắt đầu lại từ đầu
+            self.tick = 0;
+            self.needs_update = true;
+        }
     }
 
-    pub fn update(&mut self) {
+   pub fn update(&mut self) {
         let now = unsafe { esp_timer_get_time() } as u64;
 
         // Nếu chưa đủ thời gian để render frame mới thì return
         if now - self.last_update < self.frame_interval {
             return;
         }
+        let delta_time = (now - self.last_update) as f32 / 1_000_000.0;
         self.last_update = now;
 
-        let speed_scaled = if self.speed < 50 {
-            (self.speed as u32) / 5
-        } else if self.speed < 150 {
-            10 + ((self.speed as u32 - 50) * 30) / 100
-        } else {
-            40 + ((self.speed as u32 - 150) * 45) / 105
-        };
-        self.tick = self.tick.wrapping_add(speed_scaled as u64 + 1);
+        let speed_factor = self.speed as f32 / 128.0;
+        self.time += delta_time * speed_factor;
 
-        // Static/Off effects
+        // Static/Off effects - LUÔN kiểm tra brightness
         if matches!(self.effect, EffectType::Static | EffectType::Off) {
-            if !self.needs_update {
-                return;
-            }
-
-            let frame = match self.effect {
+            let current_frame = match self.effect {
                 EffectType::Static => vec![self.color; self.num_leds],
                 EffectType::Off => vec![RGB8 { r: 0, g: 0, b: 0 }; self.num_leds],
                 _ => unreachable!(),
             };
-
-            if frame != self.prev_frame {
-                self.update_frame(&frame);
-                self.prev_frame = frame;
+            
+            // Áp dụng brightness vào frame hiện tại để so sánh
+            let adjusted_frame: Vec<RGB8> = current_frame.iter().map(|&pixel| {
+                RGB8 {
+                    r: ((pixel.r as f32) * self.brightness) as u8,
+                    g: ((pixel.g as f32) * self.brightness) as u8,
+                    b: ((pixel.b as f32) * self.brightness) as u8,
+                }
+            }).collect();
+            
+            // So sánh với frame trước đó (đã được áp dụng brightness)
+            if adjusted_frame != self.prev_frame || self.needs_update {
+                self.update_frame(&current_frame); // Gửi frame gốc chưa adjust brightness
+                self.prev_frame = adjusted_frame;  // Lưu frame đã adjust để so sánh
             }
+            
             self.needs_update = false;
             return;
         }
-   
+    
         let frame = match self.effect {
             EffectType::Rainbow => self.rainbow_effect(),
             EffectType::Blink => self.blink_effect(),
             EffectType::BlinkRainbow => self.blink_rainbow_effect(),
-            EffectType::Aurora => self.aurora_effect(),
+            EffectType::TheaterChase => self.theater_chase_effect(),
             EffectType::Meteor => self.meteor_effect(),
             EffectType::ColorWipe => self.colorwipe_effect(),
             _ => unreachable!(),
@@ -157,13 +172,10 @@ impl<'a> LedController<'a> {
     fn rainbow_effect(&self) -> Vec<RGB8> {
         let mut frame = Vec::with_capacity(self.num_leds);
 
-        // tick bạn đã tăng theo speed trong update()
-        let offset = self.tick as usize;
+        let time_offset = (self.time * 360.0) as usize; // 1 vòng/giây ở speed 128
 
         for i in 0..self.num_leds {
-            // Hue tăng dần theo vị trí + offset → tạo chuyển động
-            let hue = ((i * 360 / self.num_leds) + offset) % 360;
-
+            let hue = ((i * 360 / self.num_leds) + time_offset) % 360;
             let color = Hsv::new(RgbHue::from_degrees(hue as f32), 1.0, 1.0);
             let srgb: Srgb = Srgb::from_color(color);
 
@@ -215,75 +227,92 @@ impl<'a> LedController<'a> {
         }
     }
 
-    fn aurora_effect(&self) -> Vec<RGB8> {
-        let mut frame = Vec::with_capacity(self.num_leds);
+    fn theater_chase_effect(&self) -> Vec<RGB8> {
+    let mut frame = vec![RGB8 { r: 0, g: 0, b: 0 }; self.num_leds];
+    
+    // Tính tốc độ chase dựa trên speed
+    let base_speed = 2.0; // 2 chu kỳ/giây ở speed 128
+    let speed_factor = (self.speed as f32 / 255.0) * 3.0 + 0.1; // 0.1-3.1x
+    let chase_rate = base_speed * speed_factor;
+    
+    // Số lượng LED trong mỗi nhóm (3 LED: sáng-tối-tối)
+    let group_size = 3;
+    
+    // Tính vị trí hiện tại của hiệu ứng dựa trên thời gian
+    let phase = (self.time * chase_rate * std::f32::consts::TAU).sin();
+    
+    for i in 0..self.num_leds {
+        // Xác định vị trí trong nhóm (0, 1, 2)
+        let group_position = i % group_size;
         
-        let speed_factor = (self.speed as f32 / 255.0) * 0.1 + 0.02;
-        let time = self.tick as f32 * speed_factor;
+        // Tạo hiệu ứng "đuổi" bằng cách so sánh phase với vị trí nhóm
+        let brightness = match group_position {
+            0 => {
+                // LED đầu nhóm - sáng nhất
+                if phase > 0.5 { 1.0 } else { 0.0 }
+            }
+            1 => {
+                // LED thứ hai - sáng vừa (theo sau)
+                if phase > 0.0 && phase <= 0.7 { 0.6 } else { 0.0 }
+            }
+            2 => {
+                // LED thứ ba - sáng yếu (theo sau nữa)
+                if phase > -0.2 && phase <= 0.5 { 0.3 } else { 0.0 }
+            }
+            _ => 0.0,
+        };
         
-        for i in 0..self.num_leds {
-            let pos = i as f32 / self.num_leds as f32;
-            
-            let wave1 = (time * 0.3 + pos * 3.141).sin();
-            let wave2 = (time * 0.5 + pos * 2.356).cos() * 0.7;
-            let wave3 = (time * 0.2 + pos * 4.0).sin() * 0.5;
-            let wave4 = (time * 0.7 + pos * 1.570).cos() * 0.3;
-            
-            let combined_wave = (wave1 + wave2 + wave3 + wave4) * 0.4 + 0.5;
-            let brightness = combined_wave.clamp(0.1, 1.0);
-            
-            let base_hue = 170.0;
-            let hue_variation = (time * 0.05 + pos * 1.0).sin() * 40.0;
-            let hue = (base_hue + hue_variation).rem_euclid(360.0);
-            
-            let saturation = 0.6 + brightness * 0.3;
-            
-            let hsv = Hsv::new(
-                RgbHue::from_degrees(hue),
-                saturation,
-                brightness
-            );
-            
-            let rgb: Srgb = Srgb::from_color(hsv);
-            frame.push(RGB8 {
-                r: (rgb.red * 255.0) as u8,
-                g: (rgb.green * 255.0) as u8,
-                b: (rgb.blue * 255.0) as u8,
-            });
+        if brightness > 0.0 {
+            frame[i] = RGB8 {
+                r: (self.color.r as f32 * brightness) as u8,
+                g: (self.color.g as f32 * brightness) as u8,
+                b: (self.color.b as f32 * brightness) as u8,
+            };
         }
-        frame
     }
+    
+    frame
+}
 
     fn colorwipe_effect(&self) -> Vec<RGB8> {
         let mut frame = vec![RGB8 { r: 0, g: 0, b: 0 }; self.num_leds];
         
-        // Tick-based wiping với wrapping
-        let wipe_speed = (self.speed as f32 / 255.0) * 80.0 + 20.0; // 20-100 ticks per cycle
-        let cycle_length = wipe_speed as u64;
+        // Tính tốc độ dựa trên speed (1-255)
+        // Speed càng cao, cycle_length càng nhỏ → chuyển động càng nhanh
+        let base_speed = 200.0; // Base speed để điều chỉnh
+        let speed_factor = (self.speed as f32 / 255.0) * 150.0 + 50.0; // 50-200
+        let cycle_length = (base_speed / speed_factor * 1000.0) as u64;
         
-        let cycle_progress = (self.tick.wrapping_rem(cycle_length)) as f32 / cycle_length as f32;
+        // Tính progress trong chu kỳ hiện tại
+        let cycle_progress = if cycle_length > 0 {
+            (self.tick % cycle_length) as f32 / cycle_length as f32
+        } else {
+            0.0
+        };
         
+        // Chia chu kỳ thành 2 phase: fill và clear
         if cycle_progress < 0.5 {
-            // Fill phase
-            let fill_progress = cycle_progress * 2.0;
-            let led_to_fill = (fill_progress * self.num_leds as f32).round() as usize;
+            // Fill phase: từ trái sang phải
+            let fill_progress = cycle_progress * 2.0; // 0.0 -> 1.0
+            let leds_to_fill = (fill_progress * self.num_leds as f32).floor() as usize;
             
-            for i in 0..led_to_fill.min(self.num_leds) {
+            for i in 0..leds_to_fill.min(self.num_leds) {
                 frame[i] = self.color;
             }
         } else {
-            // Clear phase
-            let clear_progress = (cycle_progress - 0.5) * 2.0;
-            let led_to_clear = (clear_progress * self.num_leds as f32).round() as usize;
+            // Clear phase: từ trái sang phải  
+            let clear_progress = (cycle_progress - 0.5) * 2.0; // 0.0 -> 1.0
+            let leds_to_clear = (clear_progress * self.num_leds as f32).floor() as usize;
             
             for i in 0..self.num_leds {
-                frame[i] = if i < led_to_clear { 
-                    RGB8 { r: 0, g: 0, b: 0 } 
-                } else { 
-                    self.color 
-                };
+                if i < leds_to_clear {
+                    frame[i] = RGB8 { r: 0, g: 0, b: 0 }; // LED tắt
+                } else {
+                    frame[i] = self.color; // LED vẫn sáng
+                }
             }
         }
+        
         frame
     }
 
@@ -292,7 +321,7 @@ impl<'a> LedController<'a> {
         
         let speed_factor = (self.speed as f32 / 255.0) * 0.3 + 0.1;
         let meteor_length = 8;
-        let num_meteors = 2;
+        let num_meteors = 3;
         
         // Tick-based meteor position với wrapping
         let main_pos = ((self.tick as f32 * speed_factor) as usize) % (self.num_leds + meteor_length * 2);
