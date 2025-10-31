@@ -27,7 +27,7 @@ fn led_task(
     channel: esp_idf_hal::rmt::CHANNEL0,
     pin: esp_idf_hal::gpio::Gpio18,
     rx: mpsc::Receiver<http::LedCommand>,
-    audio_proc: Arc<audio::AudioProcessor>,
+    // audio_proc: Arc<audio::AudioProcessor>,
 ) -> Result<(), anyhow::Error> {
     // RMT on core 1
     let ws2812 = Ws2812Esp32RmtDriver::new(channel, pin)?;
@@ -36,7 +36,7 @@ fn led_task(
     info!("RMT driver initialized on core {:?}", esp_idf_svc::hal::cpu::core());
 
     // Set audio processor
-    controller.set_audio_processor(audio_proc);
+    // controller.set_audio_processor(audio_proc);
 
     // Set default effect
     controller.set_effect(EffectType::Off);
@@ -107,13 +107,21 @@ fn main() -> anyhow::Result<()> {
 
     // Start I2S audio processing
     info!("Initializing I2S audio processor (INMP441)...");
-    let audio_processor = audio::start_i2s_audio_task(
-        i2s,
-        sck_pin,
-        ws_pin,
-        sd_pin,
-    )?;
-    info!("Audio processor initialized");
+    ThreadSpawnConfiguration {
+        name: Some(b"audio-task\0"),
+        stack_size: 8192,
+        pin_to_core: Some(Core::Core0),
+        ..Default::default()
+    }.set()?;
+
+    // let audio_processor = audio::start_i2s_audio_task(
+    //     i2s,
+    //     sck_pin,
+    //     ws_pin,
+    //     sd_pin,
+    // )?;
+    
+    info!("Audio processor initialized and pinned to {:?}", esp_idf_svc::hal::cpu::core());
 
     // Create channel for led control
     let (tx, rx) = mpsc::channel::<http::LedCommand>();
@@ -127,13 +135,14 @@ fn main() -> anyhow::Result<()> {
         name: Some(b"led-task\0"),
         stack_size: 8192,
         pin_to_core: Some(Core::Core1),
+        priority: 20,
         ..Default::default()
     }.set()?;
 
     // Spawn LED thread on core 1
-    let audio_proc_clone = audio_processor.clone();
+    // let audio_proc_clone = audio_processor.clone();
     thread::spawn(move || {
-        if let Err(e) = led_task(channel, led_pin, rx, audio_proc_clone) {
+        if let Err(e) = led_task(channel, led_pin, rx) {
             log::error!("LED task error: {:?}", e);
         }
     });

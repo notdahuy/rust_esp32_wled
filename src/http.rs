@@ -27,11 +27,7 @@ enum ModeRequest {
     Static,
     Off,
     Rainbow,
-    Blink,
-    BlinkRainbow,
-    Aurora,
-    Meteor,
-    ColorWipe,
+
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,11 +157,6 @@ pub fn start_http_server(tx: Sender<LedCommand>) -> Result<EspHttpServer<'static
                 ModeRequest::On | ModeRequest::Static => (EffectType::Static, "static"),
                 ModeRequest::Off => (EffectType::Off, "off"),
                 ModeRequest::Rainbow => (EffectType::Rainbow, "rainbow"),
-                ModeRequest::Blink => (EffectType::Blink, "blink"),
-                ModeRequest::BlinkRainbow => (EffectType::BlinkRainbow, "blink_rainbow"),
-                ModeRequest::Aurora => (EffectType::TheaterChase, "theater_chase"),
-                ModeRequest::Meteor => (EffectType::Meteor, "meteor"),
-                ModeRequest::ColorWipe => (EffectType::ColorWipe, "colorwipe"),
             };
             
             info!("LED: Mode changed to {:?}", effect);
