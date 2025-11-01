@@ -1,3 +1,5 @@
+
+use heapless::spsc::{Queue, Consumer};
 use esp_idf_hal::{
     cpu::{self, Core},
     delay::FreeRtos,
@@ -15,24 +17,26 @@ use smart_leds::RGB8;
 use controller::LedController;
 use ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriver;
 
-use std::{sync::{mpsc, Arc}, thread};
+use std::{sync::{Arc, Mutex}, thread};
 use controller::EffectType;
+use crate::http::LedCommand;
 
 mod wifi;
 mod controller;
 mod http;
 mod audio;
 
+static mut Q: Queue<LedCommand, 8> = Queue::new();
+
 fn led_task(
     channel: esp_idf_hal::rmt::CHANNEL0,
     pin: esp_idf_hal::gpio::Gpio18,
-    rx: mpsc::Receiver<http::LedCommand>,
+    mut consumer: Consumer<'static, LedCommand>, 
     // audio_proc: Arc<audio::AudioProcessor>,
 ) -> Result<(), anyhow::Error> {
     // RMT on core 1
     let ws2812 = Ws2812Esp32RmtDriver::new(channel, pin)?;
     let mut controller = LedController::new(ws2812, 144);
-
     info!("RMT driver initialized on core {:?}", esp_idf_svc::hal::cpu::core());
 
     // Set audio processor
@@ -43,41 +47,31 @@ fn led_task(
 
     loop {
         // Xử lý commands từ HTTP
-        match rx.try_recv() {
-            Ok(cmd) => {
-                match cmd {
-                    http::LedCommand::SetEffect(effect) => {
-                        info!("Received effect command: {:?}", effect);
-                        controller.set_effect(effect);
-                    }
-                    http::LedCommand::SetBrightness(brightness) => {
-                        info!("Received brightness command: {}", brightness);
-                        controller.set_brightness(brightness);
-                    }
-                    http::LedCommand::SetColor(r, g, b) => {
-                        info!("Received color command: R:{} G:{} B:{}", r, g, b);
-                        controller.set_color(RGB8 { r, g, b });
-                    }
-                    http::LedCommand::SetSpeed(speed) => {
-                        info!("Received speed command: {}", speed);
-                        controller.set_speed(speed);
-                    }
+        
+        if let Some(cmd) = consumer.dequeue() {
+            match cmd {
+                http::LedCommand::SetEffect(effect) => {
+                    info!("Received effect command: {:?}", effect);
+                    controller.set_effect(effect);
+                }
+                http::LedCommand::SetBrightness(brightness) => {
+                    info!("Received brightness command: {}", brightness);
+                    controller.set_brightness(brightness);
+                }
+                http::LedCommand::SetColor(r, g, b) => {
+                    info!("Received color command: R:{} G:{} B:{}", r, g, b);
+                    controller.set_color(RGB8 { r, g, b });
+                }
+                http::LedCommand::SetSpeed(speed) => {
+                    info!("Received speed command: {}", speed);
+                    controller.set_speed(speed);
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => {
-                // No command, continue normal operation
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                log::error!("Channel disconnected");
-                break;
-            }
         }
-
+       
         controller.update();
         FreeRtos::delay_ms(1);
     }
-
-    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -106,13 +100,13 @@ fn main() -> anyhow::Result<()> {
     info!("Main thread running on core {:?}", esp_idf_svc::hal::cpu::core());
 
     // Start I2S audio processing
-    info!("Initializing I2S audio processor (INMP441)...");
-    ThreadSpawnConfiguration {
-        name: Some(b"audio-task\0"),
-        stack_size: 8192,
-        pin_to_core: Some(Core::Core0),
-        ..Default::default()
-    }.set()?;
+    // info!("Initializing I2S audio processor (INMP441)...");
+    // ThreadSpawnConfiguration {
+    //     name: Some(b"audio-task\0"),
+    //     stack_size: 8192,
+    //     pin_to_core: Some(Core::Core0),
+    //     ..Default::default()
+    // }.set()?;
 
     // let audio_processor = audio::start_i2s_audio_task(
     //     i2s,
@@ -120,14 +114,13 @@ fn main() -> anyhow::Result<()> {
     //     ws_pin,
     //     sd_pin,
     // )?;
-    
     info!("Audio processor initialized and pinned to {:?}", esp_idf_svc::hal::cpu::core());
 
-    // Create channel for led control
-    let (tx, rx) = mpsc::channel::<http::LedCommand>();
+    let (producer, consumer) = unsafe { Q.split() };
+    let producer = Arc::new(Mutex::new(producer));
 
     // Start HTTP server
-    let _server = http::start_http_server(tx)?;
+    let _server = http::start_http_server(producer.clone())?;
     info!("HTTP server started successfully");
 
     // Thread spawn config for Core 1
@@ -142,7 +135,7 @@ fn main() -> anyhow::Result<()> {
     // Spawn LED thread on core 1
     // let audio_proc_clone = audio_processor.clone();
     thread::spawn(move || {
-        if let Err(e) = led_task(channel, led_pin, rx) {
+        if let Err(e) = led_task(channel, led_pin, consumer) {
             log::error!("LED task error: {:?}", e);
         }
     });

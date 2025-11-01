@@ -8,32 +8,6 @@ use ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriver;
 use palette::{FromColor, Hsv, RgbHue, Srgb};
 use crate::audio::AudioProcessor;
 
-struct FrameTimeDebugger {
-    stutter_threshold_us: u64,
-    last_warning_time: u64,
-    warning_cooldown_ms: u64,
-}
-
-impl FrameTimeDebugger {
-    fn new(threshold_us: u64) -> Self {
-        Self {
-            stutter_threshold_us: threshold_us,
-            last_warning_time: 0,
-            warning_cooldown_ms: 2000, // Chỉ in cảnh báo mỗi 2 giây
-        }
-    }
-
-    fn check(&mut self, delta_us: u64, now: u64) {
-        if delta_us > self.stutter_threshold_us {
-            let now_ms = now / 1000;
-            if now_ms - self.last_warning_time > self.warning_cooldown_ms {
-                warn!("[DEBUG] Frame time spike detected! Delta: {} us", delta_us);
-                self.last_warning_time = now_ms;
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum EffectType {
     Static,
@@ -50,14 +24,12 @@ pub struct LedController<'a> {
     speed: u8,
     last_update: u64,
     frame_interval: u64,
-    // time: f32,
     phase16: u16,
     audio_processor: Option<Arc<AudioProcessor>>,
     front_buffer: Vec<RGB8>,
     back_buffer: Vec<RGB8>,
     tx_buffer: Vec<u8>,
     needs_update: bool,
-    debugger: FrameTimeDebugger,
 }
 
 impl<'a> LedController<'a> {
@@ -71,14 +43,12 @@ impl<'a> LedController<'a> {
             speed: 128,
             last_update: unsafe { esp_timer_get_time() } as u64,
             frame_interval: 16_667,
-            // time: 0.0,
             phase16: 0,
             audio_processor: None,
             front_buffer: vec![RGB8 { r: 0, g: 0, b: 0 }; num_leds],
             back_buffer: vec![RGB8 { r: 0, g: 0, b: 0 }; num_leds],
             tx_buffer: Vec::with_capacity(num_leds * 3),
-            needs_update: true, 
-            debugger: FrameTimeDebugger::new(45_000),
+            needs_update: true,
         }
     }
 
@@ -123,7 +93,6 @@ impl<'a> LedController<'a> {
         if now - self.last_update < self.frame_interval { return; }
 
         let delta_us = now - self.last_update;
-        self.debugger.check(delta_us, now);
         self.last_update = now;
 
         let phase_increment = (self.speed as u64 * delta_us) / 16000;

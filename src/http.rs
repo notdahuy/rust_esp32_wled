@@ -1,10 +1,11 @@
-use std::sync::mpsc::Sender;
 use anyhow::Result;
 use esp_idf_svc::http::server::{EspHttpServer, Configuration};
 use esp_idf_svc::io::Write;
 use crate::controller::EffectType;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use heapless::spsc::Producer;
+use std::sync::{Arc, Mutex};
 
 pub enum LedCommand {
     SetEffect(EffectType),
@@ -75,14 +76,13 @@ struct ErrorResponse {
     message: String,
 }
 
-pub fn start_http_server(tx: Sender<LedCommand>) -> Result<EspHttpServer<'static>> {
+pub fn start_http_server(producer: Arc<Mutex<Producer<'static, LedCommand>>>) -> Result<EspHttpServer<'static>> {
     let config = Configuration::default();
     let mut server = EspHttpServer::new(&config)?;
     
     info!("HTTP Server starting on port 80...");
 
     // POST /led - Main control endpoint with JSON body
-    let tx_led = tx.clone();
     server.fn_handler::<anyhow::Error, _>("/led", esp_idf_svc::http::Method::Post, move |mut req| {
         // Read body
         let mut buf = vec![0u8; 512];
@@ -126,13 +126,11 @@ pub fn start_http_server(tx: Sender<LedCommand>) -> Result<EspHttpServer<'static
 
         // Handle color FIRST
         if let Some(color) = led_req.color {
-            info!("LED: Set color to R:{} G:{} B:{}", color.r, color.g, color.b);
-            let _ = tx_led.send(LedCommand::SetColor(color.r, color.g, color.b));
-            success_response.color = Some(ColorResponse {
-                r: color.r,
-                g: color.g,
-                b: color.b,
-            });
+           let cmd = LedCommand::SetColor(color.r, color.g, color.b);
+            // enqueue() trả về Result, cần xử lý trường hợp queue đầy
+            if producer.lock().unwrap().enqueue(cmd).is_err() {
+                warn!("Command queue is full!");
+            }
         }
 
         // Handle brightness
@@ -140,14 +138,20 @@ pub fn start_http_server(tx: Sender<LedCommand>) -> Result<EspHttpServer<'static
             let clamped = level.min(100);
             let brightness_val = (clamped as f32) / 100.0;
             info!("LED: Set brightness to {}%", clamped);
-            let _ = tx_led.send(LedCommand::SetBrightness(brightness_val));
+            let cmd = LedCommand::SetBrightness(brightness_val);
+            if producer.lock().unwrap().enqueue(cmd).is_err() {
+                warn!("Command queue is full!");
+            }
             success_response.brightness = Some(clamped);
         }
 
         // Handle speed
         if let Some(spd) = led_req.speed {
             info!("LED: Set speed to {}", spd);
-            let _ = tx_led.send(LedCommand::SetSpeed(spd));
+            let cmd = LedCommand::SetSpeed(spd);
+            if producer.lock().unwrap().enqueue(cmd).is_err() {
+                warn!("Command queue is full!");
+            }
             success_response.speed = Some(spd);
         }
 
@@ -160,7 +164,10 @@ pub fn start_http_server(tx: Sender<LedCommand>) -> Result<EspHttpServer<'static
             };
             
             info!("LED: Mode changed to {:?}", effect);
-            let _ = tx_led.send(LedCommand::SetEffect(effect));
+            let cmd = LedCommand::SetEffect(effect);
+            if producer.lock().unwrap().enqueue(cmd).is_err() {
+                warn!("Command queue is full!");
+            }
             success_response.mode = Some(mode_str.to_string());
         }
 
