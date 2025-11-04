@@ -6,12 +6,13 @@ use log::warn;
 use smart_leds::RGB8;
 use ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriver;
 use palette::{FromColor, Hsv, RgbHue, Srgb};
-use crate::audio::AudioProcessor;
+use crate::audio::AudioLedParams;
 
 #[derive(Debug, Clone)]
 pub enum EffectType {
     Static,
     Rainbow,    
+    MusicReactive,
     Off,            
 }
 
@@ -25,7 +26,6 @@ pub struct LedController<'a> {
     last_update: u64,
     frame_interval: u64,
     phase16: u16,
-    audio_processor: Option<Arc<AudioProcessor>>,
     front_buffer: Vec<RGB8>,
     back_buffer: Vec<RGB8>,
     tx_buffer: Vec<u8>,
@@ -42,18 +42,13 @@ impl<'a> LedController<'a> {
             effect: EffectType::Static,
             speed: 128,
             last_update: unsafe { esp_timer_get_time() } as u64,
-            frame_interval: 16_667,
+            frame_interval: 33_333,
             phase16: 0,
-            audio_processor: None,
             front_buffer: vec![RGB8 { r: 0, g: 0, b: 0 }; num_leds],
             back_buffer: vec![RGB8 { r: 0, g: 0, b: 0 }; num_leds],
             tx_buffer: Vec::with_capacity(num_leds * 3),
             needs_update: true,
         }
-    }
-
-    pub fn set_audio_processor(&mut self, processor: Arc<AudioProcessor>) {
-        self.audio_processor = Some(processor);
     }
 
     pub fn set_brightness(&mut self, level: f32) {
@@ -88,7 +83,7 @@ impl<'a> LedController<'a> {
         }
     }
 
-    pub fn update(&mut self) {
+    pub fn update(&mut self, audio_params: Option<&AudioLedParams>) {
         let now = unsafe { esp_timer_get_time() } as u64;
         if now - self.last_update < self.frame_interval { return; }
 
@@ -99,7 +94,7 @@ impl<'a> LedController<'a> {
         self.phase16 = self.phase16.wrapping_add(phase_increment as u16);
 
         // Render trực tiếp vào back_buffer
-        self.render_to_back_buffer();
+        self.render_to_back_buffer(audio_params);
 
         // Chỉ swap và update nếu có thay đổi
         if self.back_buffer != self.front_buffer || self.needs_update {
@@ -109,7 +104,7 @@ impl<'a> LedController<'a> {
         }
     }
 
-    fn render_to_back_buffer(&mut self) {
+    fn render_to_back_buffer(&mut self, audio_params: Option<&AudioLedParams>) {
         match self.effect {
             EffectType::Static => {
                 for pixel in self.back_buffer.iter_mut() {
@@ -123,6 +118,15 @@ impl<'a> LedController<'a> {
             }
             EffectType::Rainbow => {
                 rainbow_effect(self.phase16, self.num_leds, &mut self.back_buffer);
+            }
+            EffectType::MusicReactive => {
+                if let Some(params) = audio_params {
+                    let intensity = (params.intensity * 255.0) as u8;
+                    let color = RGB8 {r: intensity, g: 0, b: intensity};
+                    for pixel in self.back_buffer.iter_mut() {
+                        *pixel = color;
+                    }
+                }
             }
         }
     }

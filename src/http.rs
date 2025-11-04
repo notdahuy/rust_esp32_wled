@@ -1,11 +1,13 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use embedded_svc::http::Headers;
 use esp_idf_svc::http::server::{EspHttpServer, Configuration};
-use esp_idf_svc::io::Write;
+use esp_idf_svc::io::{Read, Write};
 use crate::controller::EffectType;
 use log::{info, warn};
-use serde::{Deserialize, Serialize};
 use heapless::spsc::Producer;
 use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
 
 pub enum LedCommand {
     SetEffect(EffectType),
@@ -14,60 +16,19 @@ pub enum LedCommand {
     SetSpeed(u8),
 }
 
-#[derive(Debug, Deserialize)]
-struct ColorRequest {
-    r: u8,
-    g: u8,
-    b: u8,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ModeRequest {
-    On,
-    Static,
-    Off,
-    Rainbow,
-
-}
-
-#[derive(Debug, Deserialize)]
-struct LedRequest {
-    #[serde(default)]
-    mode: Option<ModeRequest>,
-    
-    #[serde(default)]
-    brightness: Option<u8>,
-    
-    #[serde(default)]
-    speed: Option<u8>,
-    
-    #[serde(default)]
-    color: Option<ColorRequest>,
-}
-
-#[derive(Debug, Serialize)]
-struct ColorResponse {
-    r: u8,
-    g: u8,
-    b: u8,
-}
+// --- XÓA CÁC STRUCT LedRequest, ColorRequest, ModeRequest ---
 
 #[derive(Debug, Serialize)]
 struct SuccessResponse {
     status: String,
-    
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
-    
     #[serde(skip_serializing_if = "Option::is_none")]
     brightness: Option<u8>,
-    
     #[serde(skip_serializing_if = "Option::is_none")]
     speed: Option<u8>,
-    
     #[serde(skip_serializing_if = "Option::is_none")]
-    color: Option<ColorResponse>,
+    color: Option<String>, // Gửi lại màu dạng Hex
 }
 
 #[derive(Debug, Serialize)]
@@ -80,42 +41,40 @@ pub fn start_http_server(producer: Arc<Mutex<Producer<'static, LedCommand>>>) ->
     let config = Configuration::default();
     let mut server = EspHttpServer::new(&config)?;
     
-    info!("HTTP Server starting on port 80...");
+    info!("HTTP Server starting on port 80 (Optimized Mode)");
 
-    // POST /led - Main control endpoint with JSON body
+    const MAX_BODY_SIZE: usize = 512;
+
     server.fn_handler::<anyhow::Error, _>("/led", esp_idf_svc::http::Method::Post, move |mut req| {
-        // Read body
-        let mut buf = vec![0u8; 512];
-        let bytes_read = req.read(&mut buf)?;
         
-        if bytes_read == 0 {
+        // 1. Đọc body vào buffer (giống như trước)
+        let mut buf = [0u8; MAX_BODY_SIZE];
+        let len = req.content_len().unwrap_or(0) as usize;
+
+        if len == 0 || len > MAX_BODY_SIZE {
+            // (Xử lý lỗi body rỗng hoặc quá lớn)
             let mut response = req.into_status_response(400)?;
-            let error = ErrorResponse {
-                status: "error".to_string(),
-                message: "Empty request body".to_string(),
-            };
+            let error = ErrorResponse { status: "error".to_string(), message: "Invalid body length".to_string() };
             response.write_all(serde_json::to_string(&error)?.as_bytes())?;
             return Ok(());
         }
 
-        // Parse JSON
-        let body = &buf[..bytes_read];
-        let led_req: LedRequest = match serde_json::from_slice(body) {
-            Ok(req) => req,
-            Err(e) => {
-                warn!("JSON parse error: {}", e);
+        req.read_exact(&mut buf[..len])?;
+        let body_str = match std::str::from_utf8(&buf[..len]) {
+            Ok(s) => s,
+            Err(_) => {
+                // (Xử lý lỗi UTF-8)
                 let mut response = req.into_status_response(400)?;
-                let error = ErrorResponse {
-                    status: "error".to_string(),
-                    message: format!("Invalid JSON: {}", e),
-                };
+                let error = ErrorResponse { status: "error".to_string(), message: "Invalid UTF-8 body".to_string() };
                 response.write_all(serde_json::to_string(&error)?.as_bytes())?;
                 return Ok(());
             }
         };
 
-        info!("LED Request: {:?}", led_req);
-
+        // 2. TỰ PHÂN TÍCH (MANUAL PARSE) - CỰC NHANH, KHÔNG CẦN SERDE
+        // Đây là phần thay thế cho serde_json::from_slice
+        
+        let mut commands_to_send: Vec<LedCommand> = Vec::with_capacity(4);
         let mut success_response = SuccessResponse {
             status: "ok".to_string(),
             mode: None,
@@ -124,67 +83,89 @@ pub fn start_http_server(producer: Arc<Mutex<Producer<'static, LedCommand>>>) ->
             color: None,
         };
 
-        // Handle color FIRST
-        if let Some(color) = led_req.color {
-           let cmd = LedCommand::SetColor(color.r, color.g, color.b);
-            // enqueue() trả về Result, cần xử lý trường hợp queue đầy
-            if producer.lock().unwrap().enqueue(cmd).is_err() {
-                warn!("Command queue is full!");
+        info!("Parsing lightweight body: '{}'", body_str);
+
+        for pair in body_str.split('&') {
+            if let Some((key, value)) = pair.split_once('=') {
+                match key {
+                    "mode" => {
+                        let (effect, mode_str) = match value {
+                            "static" => (EffectType::Static, "static"),
+                            "off" => (EffectType::Off, "off"),
+                            "rainbow" => (EffectType::Rainbow, "rainbow"),
+                            "music" => (EffectType::MusicReactive, "music"),
+                            _ => continue, // Bỏ qua mode không hợp lệ
+                        };
+                        commands_to_send.push(LedCommand::SetEffect(effect));
+                        success_response.mode = Some(mode_str.to_string());
+                    }
+                    "brightness" => {
+                        if let Ok(val) = value.parse::<u8>() {
+                            let clamped = val.min(100);
+                            let brightness_val = (clamped as f32) / 100.0;
+                            commands_to_send.push(LedCommand::SetBrightness(brightness_val));
+                            success_response.brightness = Some(clamped);
+                        }
+                    }
+                    "speed" => {
+                        if let Ok(val) = value.parse::<u8>() {
+                            commands_to_send.push(LedCommand::SetSpeed(val));
+                            success_response.speed = Some(val);
+                        }
+                    }
+                    "color" => {
+                        // Phân tích màu Hex (ví dụ: FF00CC)
+                        if let Ok((r, g, b)) = parse_hex_color(value) {
+                            commands_to_send.push(LedCommand::SetColor(r, g, b));
+                            success_response.color = Some(value.to_string());
+                        }
+                    }
+                    _ => {
+                        // Bỏ qua các key không biết
+                    }
+                }
             }
         }
 
-        // Handle brightness
-        if let Some(level) = led_req.brightness {
-            let clamped = level.min(100);
-            let brightness_val = (clamped as f32) / 100.0;
-            info!("LED: Set brightness to {}%", clamped);
-            let cmd = LedCommand::SetBrightness(brightness_val);
-            if producer.lock().unwrap().enqueue(cmd).is_err() {
-                warn!("Command queue is full!");
+        // 3. Gửi lệnh (Giống như trước)
+        if !commands_to_send.is_empty() {
+            if let Ok(mut producer_guard) = producer.lock() {
+                for cmd in commands_to_send {
+                    if producer_guard.enqueue(cmd).is_err() {
+                        warn!("Command queue is full!");
+                        break;
+                    }
+                }
+            } else {
+                warn!("Mutex lock failed!");
             }
-            success_response.brightness = Some(clamped);
         }
 
-        // Handle speed
-        if let Some(spd) = led_req.speed {
-            info!("LED: Set speed to {}", spd);
-            let cmd = LedCommand::SetSpeed(spd);
-            if producer.lock().unwrap().enqueue(cmd).is_err() {
-                warn!("Command queue is full!");
-            }
-            success_response.speed = Some(spd);
-        }
-
-        // Handle mode LAST
-        if let Some(mode) = led_req.mode {
-            let (effect, mode_str) = match mode {
-                ModeRequest::On | ModeRequest::Static => (EffectType::Static, "static"),
-                ModeRequest::Off => (EffectType::Off, "off"),
-                ModeRequest::Rainbow => (EffectType::Rainbow, "rainbow"),
-            };
-            
-            info!("LED: Mode changed to {:?}", effect);
-            let cmd = LedCommand::SetEffect(effect);
-            if producer.lock().unwrap().enqueue(cmd).is_err() {
-                warn!("Command queue is full!");
-            }
-            success_response.mode = Some(mode_str.to_string());
-        }
-
-        // Send success response
+        // 4. Trả về Response
         let mut response = req.into_ok_response()?;
         response.write_all(serde_json::to_string(&success_response)?.as_bytes())?;
         Ok(())
     })?;
 
-    // GET /status - Get current status
+    // ... (handler /status giữ nguyên) ...
     server.fn_handler::<anyhow::Error, _>("/status", esp_idf_svc::http::Method::Get, |req| {
         info!("Status requested");
         let mut response = req.into_ok_response()?;
-        response.write_all(b"{\"status\":\"ok\",\"device\":\"LED Controller\",\"version\":\"3.0\"}")?;
+        response.write_all(b"{\"status\":\"ok\",\"device\":\"LED Controller\",\"version\":\"3.1-optimized\"}")?;
         Ok(())
     })?;
 
-    info!("HTTP Server started successfully");
+
     Ok(server)
+}
+
+/// Hàm helper siêu nhẹ để phân tích màu Hex (vd: "FF00CC")
+fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), ()> {
+    if s.len() != 6 {
+        return Err(());
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).map_err(|_| ())?;
+    let g = u8::from_str_radix(&s[2..4], 16).map_err(|_| ())?;
+    let b = u8::from_str_radix(&s[4..6], 16).map_err(|_| ())?;
+    Ok((r, g, b))
 }

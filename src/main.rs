@@ -17,8 +17,7 @@ use smart_leds::RGB8;
 use controller::LedController;
 use ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriver;
 
-use std::{sync::{Arc, Mutex}, thread};
-use controller::EffectType;
+use std::{sync::{Arc, Mutex, RwLock}, thread};
 use crate::http::LedCommand;
 
 mod wifi;
@@ -32,18 +31,15 @@ fn led_task(
     channel: esp_idf_hal::rmt::CHANNEL0,
     pin: esp_idf_hal::gpio::Gpio18,
     mut consumer: Consumer<'static, LedCommand>, 
-    // audio_proc: Arc<audio::AudioProcessor>,
+    audio_proc: Arc<RwLock<audio::AudioData>>,
 ) -> Result<(), anyhow::Error> {
     // RMT on core 1
     let ws2812 = Ws2812Esp32RmtDriver::new(channel, pin)?;
     let mut controller = LedController::new(ws2812, 144);
     info!("RMT driver initialized on core {:?}", esp_idf_svc::hal::cpu::core());
 
-    // Set audio processor
-    // controller.set_audio_processor(audio_proc);
-
-    // Set default effect
-    controller.set_effect(EffectType::Off);
+    controller.set_brightness(0.5);
+    controller.set_effect(controller::EffectType::Rainbow);
 
     loop {
         // Xử lý commands từ HTTP
@@ -68,9 +64,9 @@ fn led_task(
                 }
             }
         }
-       
-        controller.update();
-        FreeRtos::delay_ms(1);
+        let led_params = audio::audio_to_led_params(&audio_proc);
+        controller.update(Some(&led_params));
+        FreeRtos::delay_ms(10);
     }
 }
 
@@ -91,29 +87,30 @@ fn main() -> anyhow::Result<()> {
 
     // Get pins for I2S microphone (INMP441)
     let i2s = peripherals.i2s0;
-    let sck_pin = peripherals.pins.gpio32;
+    let sck_pin = peripherals.pins.gpio33;
     let ws_pin = peripherals.pins.gpio25;
-    let sd_pin = peripherals.pins.gpio33;
+    let sd_pin = peripherals.pins.gpio32;
 
     let cpu_cores = cpu::CORES;
     info!("Core counts {} cores", cpu_cores);
     info!("Main thread running on core {:?}", esp_idf_svc::hal::cpu::core());
 
     // Start I2S audio processing
-    // info!("Initializing I2S audio processor (INMP441)...");
-    // ThreadSpawnConfiguration {
-    //     name: Some(b"audio-task\0"),
-    //     stack_size: 8192,
-    //     pin_to_core: Some(Core::Core0),
-    //     ..Default::default()
-    // }.set()?;
+    info!("Initializing I2S audio processor (INMP441)...");
+    ThreadSpawnConfiguration {
+        name: Some(b"audio-task\0"),
+        stack_size: 8192,
+        pin_to_core: Some(Core::Core0),
+        ..Default::default()
+    }.set()?;
 
-    // let audio_processor = audio::start_i2s_audio_task(
-    //     i2s,
-    //     sck_pin,
-    //     ws_pin,
-    //     sd_pin,
-    // )?;
+    let audio_data_arc = audio::start_i2s_audio_task(
+        i2s,
+        sck_pin,
+        ws_pin,
+        sd_pin,
+    )?;
+    // let audio_data_arc = Arc::new(RwLock::new(audio::AudioData::default()));
     info!("Audio processor initialized and pinned to {:?}", esp_idf_svc::hal::cpu::core());
 
     let (producer, consumer) = unsafe { Q.split() };
@@ -133,9 +130,9 @@ fn main() -> anyhow::Result<()> {
     }.set()?;
 
     // Spawn LED thread on core 1
-    // let audio_proc_clone = audio_processor.clone();
+    let audio_data_clone = audio_data_arc.clone();
     thread::spawn(move || {
-        if let Err(e) = led_task(channel, led_pin, consumer) {
+        if let Err(e) = led_task(channel, led_pin, consumer, audio_data_clone) {
             log::error!("LED task error: {:?}", e);
         }
     });

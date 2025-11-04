@@ -5,6 +5,7 @@ use esp_idf_svc::{
 use esp_idf_svc::timer::Task;
 use log::info;
 use anyhow::Result;
+use futures::executor::block_on;
 
 const SSID: &str = "MY CHAU";
 const PASSWORD: &str = "0908814847";
@@ -16,7 +17,7 @@ pub fn wifi(
     nvs: Option<EspNvsPartition<NvsDefault>>,
     timer_service: EspTimerService<Task>,
 ) -> Result<AsyncWifi<EspWifi<'static>>> {
-    use futures::executor::block_on;
+
 
     let mut wifi = AsyncWifi::wrap(
         EspWifi::new(modem, sysloop.clone(), nvs)?,
@@ -36,7 +37,7 @@ pub fn wifi(
     Ok(wifi)
 }
 
-
+#[warn(dead_code)]
 // Hàm để khởi động Access Point
 async fn start_access_point(wifi: &mut AsyncWifi<EspWifi<'static>>) -> anyhow::Result<()> {
     let ap_configuration: Configuration = Configuration::AccessPoint(esp_idf_svc::wifi::AccessPointConfiguration {
