@@ -44,7 +44,7 @@ fn led_task(
     loop {
         // Xử lý commands từ HTTP
         
-        if let Some(cmd) = consumer.dequeue() {
+        while let Some(cmd) = consumer.dequeue() {
             match cmd {
                 http::LedCommand::SetEffect(effect) => {
                     info!("Received effect command: {:?}", effect);
@@ -96,21 +96,21 @@ fn main() -> anyhow::Result<()> {
 
     // // Start I2S audio processing
     info!("Initializing I2S audio processor (INMP441)...");
-    ThreadSpawnConfiguration {
-        name: Some(b"audio-task\0"),
-        stack_size: 8192,
-        pin_to_core: Some(Core::Core0),
-        priority: 15,
-        ..Default::default()
-    }.set()?;
+    // ThreadSpawnConfiguration {
+    //     name: Some(b"audio-task\0"),
+    //     stack_size: 8192,
+    //     pin_to_core: Some(Core::Core0),
+    //     priority: 15,
+    //     ..Default::default()
+    // }.set()?;
 
-    let audio_data_arc = audio::start_i2s_audio_task(
-        i2s,
-        sck_pin,
-        ws_pin,
-        sd_pin,
-    )?;
-    // let audio_data_arc = Arc::new(audio::AudioData::default());
+    // let audio_data_arc = audio::start_i2s_audio_task(
+    //     i2s,
+    //     sck_pin,
+    //     ws_pin,
+    //     sd_pin,
+    // )?;
+    let audio_data_arc = Arc::new(audio::AudioData::default());
     let audio_data_clone = audio_data_arc.clone();
     info!("Audio processor initialized and pinned to {:?}", esp_idf_svc::hal::cpu::core());
 

@@ -7,14 +7,7 @@ use log::{info, warn};
 use heapless::spsc::Producer;
 use heapless::Vec;
 use std::sync::{Arc, Mutex};
-// Thêm thư viện để ghi chuỗi (no alloc)
 use core::fmt::Write as FmtWrite;
-
-// --- LOẠI BỎ HOÀN TOÀN: serde, SuccessResponse, ErrorResponse ---
-// use serde::Serialize;
-// #[derive(Debug, Serialize)] struct SuccessResponse ...
-// #[derive(Debug, Serialize)] struct ErrorResponse ...
-
 
 pub enum LedCommand {
     SetEffect(EffectType),
@@ -76,9 +69,6 @@ pub fn start_http_server(producer: Arc<Mutex<Producer<'static, LedCommand>>>) ->
                             "static" => (EffectType::Static, "static"),
                             "off" => (EffectType::Off, "off"),
                             "rainbow" => (EffectType::Rainbow, "rainbow"),
-                            "bass" => (EffectType::MusicBassPulse, "bass"),
-                            "spectral" => (EffectType::MusicSpectral, "spectral"),
-                            "vu" => (EffectType::MusicVU, "vu"),
                             _ => continue,
                         };
                         commands_to_send.push(LedCommand::SetEffect(effect));
