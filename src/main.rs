@@ -18,7 +18,7 @@ use controller::LedController;
 use ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriver;
 
 use std::{sync::{Arc, Mutex, RwLock}, thread};
-use crate::http::LedCommand;
+use crate::{audio::AudioData, http::LedCommand};
 
 mod wifi;
 mod controller;
@@ -31,7 +31,7 @@ fn led_task(
     channel: esp_idf_hal::rmt::CHANNEL0,
     pin: esp_idf_hal::gpio::Gpio18,
     mut consumer: Consumer<'static, LedCommand>, 
-    audio_proc: Arc<RwLock<audio::AudioData>>,
+    audio_proc: Arc<AudioData>,
 ) -> Result<(), anyhow::Error> {
     // RMT on core 1
     let ws2812 = Ws2812Esp32RmtDriver::new(channel, pin)?;
@@ -64,9 +64,8 @@ fn led_task(
                 }
             }
         }
-        let led_params = audio::audio_to_led_params(&audio_proc);
-        controller.update(Some(&led_params));
-        FreeRtos::delay_ms(10);
+        controller.update(Some(&audio_proc));
+        FreeRtos::delay_ms(1);
     }
 }
 
@@ -95,12 +94,13 @@ fn main() -> anyhow::Result<()> {
     info!("Core counts {} cores", cpu_cores);
     info!("Main thread running on core {:?}", esp_idf_svc::hal::cpu::core());
 
-    // Start I2S audio processing
+    // // Start I2S audio processing
     info!("Initializing I2S audio processor (INMP441)...");
     ThreadSpawnConfiguration {
         name: Some(b"audio-task\0"),
         stack_size: 8192,
         pin_to_core: Some(Core::Core0),
+        priority: 15,
         ..Default::default()
     }.set()?;
 
@@ -110,7 +110,8 @@ fn main() -> anyhow::Result<()> {
         ws_pin,
         sd_pin,
     )?;
-    // let audio_data_arc = Arc::new(RwLock::new(audio::AudioData::default()));
+    // let audio_data_arc = Arc::new(audio::AudioData::default());
+    let audio_data_clone = audio_data_arc.clone();
     info!("Audio processor initialized and pinned to {:?}", esp_idf_svc::hal::cpu::core());
 
     let (producer, consumer) = unsafe { Q.split() };
@@ -130,7 +131,7 @@ fn main() -> anyhow::Result<()> {
     }.set()?;
 
     // Spawn LED thread on core 1
-    let audio_data_clone = audio_data_arc.clone();
+
     thread::spawn(move || {
         if let Err(e) = led_task(channel, led_pin, consumer, audio_data_clone) {
             log::error!("LED task error: {:?}", e);

@@ -1,23 +1,36 @@
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use esp_idf_sys::esp_timer_get_time;
 use log::warn;
 use smart_leds::RGB8;
 use ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriver;
 use palette::{FromColor, Hsv, RgbHue, Srgb};
-use crate::audio::AudioLedParams;
+use crate::audio::AudioData;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EffectType {
     Static,
     Rainbow,    
-    MusicReactive,
+    MusicBassPulse, // Ví dụ: Nháy màu tím theo bass
+    MusicVU,        // Ví dụ: Thước đo VU màu xanh lá
+    MusicSpectral,  // Ví dụ: RGB = Bass, Mid, Treble
     Off,            
 }
 
+impl EffectType {
+    pub fn is_music_effect(&self) -> bool {
+        match self {
+            EffectType::MusicBassPulse |
+            EffectType::MusicVU |
+            EffectType::MusicSpectral => true,
+            // Tất cả các hiệu ứng khác
+            _ => false,
+        }
+    }
+}
+
 pub struct LedController<'a> {
-    driver: Arc<Mutex<Ws2812Esp32RmtDriver<'a>>>,
+    driver: Ws2812Esp32RmtDriver<'a>,
     num_leds: usize,
     brightness: f32,
     color: RGB8,
@@ -35,7 +48,7 @@ pub struct LedController<'a> {
 impl<'a> LedController<'a> {
     pub fn new(driver: Ws2812Esp32RmtDriver<'a>, num_leds: usize) -> Self {
         Self {
-            driver: Arc::new(Mutex::new(driver)),
+            driver: driver,
             num_leds,
             brightness: 1.0,
             color: RGB8 { r: 150, g: 150, b: 150 },
@@ -83,7 +96,7 @@ impl<'a> LedController<'a> {
         }
     }
 
-    pub fn update(&mut self, audio_params: Option<&AudioLedParams>) {
+    pub fn update(&mut self, audio_data: Option<&Arc<AudioData>>) {
         let now = unsafe { esp_timer_get_time() } as u64;
         if now - self.last_update < self.frame_interval { return; }
 
@@ -93,8 +106,14 @@ impl<'a> LedController<'a> {
         let phase_increment = (self.speed as u64 * delta_us) / 16000;
         self.phase16 = self.phase16.wrapping_add(phase_increment as u16);
 
+        let effective_audio = if self.effect.is_music_effect() {
+            audio_data 
+        } else {
+            None 
+        };
+
         // Render trực tiếp vào back_buffer
-        self.render_to_back_buffer(audio_params);
+        self.render_to_back_buffer(effective_audio);
 
         // Chỉ swap và update nếu có thay đổi
         if self.back_buffer != self.front_buffer || self.needs_update {
@@ -104,7 +123,7 @@ impl<'a> LedController<'a> {
         }
     }
 
-    fn render_to_back_buffer(&mut self, audio_params: Option<&AudioLedParams>) {
+    fn render_to_back_buffer(&mut self, audio_data: Option<&Arc<AudioData>>) {
         match self.effect {
             EffectType::Static => {
                 for pixel in self.back_buffer.iter_mut() {
@@ -119,13 +138,19 @@ impl<'a> LedController<'a> {
             EffectType::Rainbow => {
                 rainbow_effect(self.phase16, self.num_leds, &mut self.back_buffer);
             }
-            EffectType::MusicReactive => {
-                if let Some(params) = audio_params {
-                    let intensity = (params.intensity * 255.0) as u8;
-                    let color = RGB8 {r: intensity, g: 0, b: intensity};
-                    for pixel in self.back_buffer.iter_mut() {
-                        *pixel = color;
-                    }
+            EffectType::MusicBassPulse => {
+                if let Some(audio) = audio_data {
+                    render_music_bass_pulse(audio, &mut self.back_buffer);
+                }
+            }
+            EffectType::MusicVU => {
+                if let Some(audio) = audio_data {
+                    render_music_vu(audio, self.num_leds, &mut self.back_buffer);
+                }
+            }
+            EffectType::MusicSpectral => {
+                if let Some(audio) = audio_data {
+                    render_music_spectral(audio, &mut self.back_buffer);
                 }
             }
         }
@@ -144,12 +169,12 @@ impl<'a> LedController<'a> {
             self.tx_buffer.extend_from_slice(&[scaled.g, scaled.r, scaled.b]);
         }
 
-        if let Ok(mut driver) = self.driver.lock() {
-            if let Err(e) = driver.write_blocking(self.tx_buffer.iter().cloned()) {
+        if let Err(e) = self.driver.write_blocking(self.tx_buffer.iter().cloned()) {
                 warn!("LED write error: {:?}", e);
             }
-        }
     }
+
+    
 
 }
 
@@ -172,3 +197,46 @@ fn rainbow_effect(phase16: u16, num_leds: usize, frame: &mut [RGB8]) {
         };
     }
 }   
+
+// HIỆU ỨNG 1: Nháy theo Bass
+fn render_music_bass_pulse(audio: &Arc<AudioData>, frame: &mut [RGB8]) {
+    let bass = audio.get_bass(); // 0.0 - 1.0
+    let color = RGB8 { r: 255, g: 0, b: 255 }; // Màu tím
+    
+    let scaled_color = scale_color(color, bass);
+    frame.fill(scaled_color); // Tô toàn bộ dải LED
+}
+
+// HIỆU ỨNG 2: Thước đo VU
+fn render_music_vu(audio: &Arc<AudioData>, num_leds: usize, frame: &mut [RGB8]) {
+    let intensity = audio.get_amplitude(); // 0.0 - 1.0
+    let leds_to_light = (intensity * num_leds as f32).round() as usize;
+
+    for (i, pixel) in frame.iter_mut().enumerate() {
+        if i < leds_to_light {
+            // Hiển thị màu xanh lá
+            *pixel = RGB8 {r: 0, g: 255, b: 0}; 
+        } else {
+            // Tắt
+            *pixel = RGB8::default(); 
+        }
+    }
+}
+
+// HIỆU ỨNG 3: Phân tích phổ màu
+fn render_music_spectral(audio: &Arc<AudioData>, frame: &mut [RGB8]) {
+    // Bass = Đỏ, Mid = Xanh lá, Treble = Xanh dương
+    let r = (audio.get_bass() * 255.0) as u8;
+    let g = (audio.get_mid() * 255.0) as u8;
+    let b = (audio.get_treble() * 255.0) as u8;
+    
+    frame.fill(RGB8 { r, g, b });
+}
+
+fn scale_color(color: RGB8, brightness: f32) -> RGB8 {
+    RGB8 {
+        r: (color.r as f32 * brightness).round() as u8,
+        g: (color.g as f32 * brightness).round() as u8,
+        b: (color.b as f32 * brightness).round() as u8,
+    }
+}
