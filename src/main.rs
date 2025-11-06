@@ -44,7 +44,7 @@ fn led_task(
     loop {
         // Xử lý commands từ HTTP
         
-        while let Some(cmd) = consumer.dequeue() {
+        if let Some(cmd) = consumer.dequeue() {
             match cmd {
                 http::LedCommand::SetEffect(effect) => {
                     info!("Received effect command: {:?}", effect);
