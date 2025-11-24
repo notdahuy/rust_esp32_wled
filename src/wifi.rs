@@ -27,9 +27,9 @@ pub fn wifi(
 
 
 
-    block_on(connect_to_wifi(&mut wifi))?;
+    block_on(start_access_point(&mut wifi))?;
 
-    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+    let ip_info = wifi.wifi().ap_netif().get_ip_info()?;
 
     info!("Thông tin Wifi DHCP: {:?}", ip_info);
     
@@ -37,7 +37,7 @@ pub fn wifi(
     Ok(wifi)
 }
 
-#[warn(dead_code)]
+
 // Hàm để khởi động Access Point
 async fn start_access_point(wifi: &mut AsyncWifi<EspWifi<'static>>) -> anyhow::Result<()> {
     let ap_configuration: Configuration = Configuration::AccessPoint(esp_idf_svc::wifi::AccessPointConfiguration {

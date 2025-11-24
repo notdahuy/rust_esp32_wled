@@ -1,7 +1,7 @@
 
 use heapless::spsc::{Queue, Consumer};
 use esp_idf_hal::{
-    cpu::{self, Core},
+    cpu::Core,
     delay::FreeRtos,
     peripherals::Peripherals,
     task::thread::ThreadSpawnConfiguration,
@@ -18,12 +18,14 @@ use controller::LedController;
 use ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriver;
 
 use std::{sync::{Arc, Mutex, RwLock}, thread};
-use crate::{audio::AudioData, http::LedCommand};
+use crate::http::LedCommand;
+use crate::audio::AudioData;
 
 mod wifi;
 mod controller;
 mod http;
 mod audio;
+mod effect;
 
 static mut Q: Queue<LedCommand, 8> = Queue::new();
 
@@ -31,15 +33,14 @@ fn led_task(
     channel: esp_idf_hal::rmt::CHANNEL0,
     pin: esp_idf_hal::gpio::Gpio18,
     mut consumer: Consumer<'static, LedCommand>, 
-    audio_proc: Arc<AudioData>,
+    audio_data: Arc<Mutex<audio::AudioData>>,
 ) -> Result<(), anyhow::Error> {
     // RMT on core 1
     let ws2812 = Ws2812Esp32RmtDriver::new(channel, pin)?;
     let mut controller = LedController::new(ws2812, 144);
+    controller.set_audio_data(audio_data);
     info!("RMT driver initialized on core {:?}", esp_idf_svc::hal::cpu::core());
 
-    controller.set_brightness(0.5);
-    controller.set_effect(controller::EffectType::Rainbow);
 
     loop {
         // Xử lý commands từ HTTP
@@ -64,9 +65,24 @@ fn led_task(
                 }
             }
         }
-        controller.update(Some(&audio_proc));
+        controller.update();
         FreeRtos::delay_ms(1);
     }
+}
+
+fn audio_task(
+    i2s: esp_idf_hal::i2s::I2S0,
+    sck: esp_idf_hal::gpio::Gpio33,
+    ws: esp_idf_hal::gpio::Gpio25,
+    sd: esp_idf_hal::gpio::Gpio32,
+    audio_data: Arc<Mutex<audio::AudioData>>,
+) -> Result<(), anyhow::Error> {
+    info!("Audio task started on core {:?}", esp_idf_svc::hal::cpu::core());
+    
+    // Use blocking version for FreeRTOS thread
+    audio::audio_processing_blocking(i2s, sck, ws, sd, audio_data)?;
+    
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -90,32 +106,12 @@ fn main() -> anyhow::Result<()> {
     let ws_pin = peripherals.pins.gpio25;
     let sd_pin = peripherals.pins.gpio32;
 
-    let cpu_cores = cpu::CORES;
-    info!("Core counts {} cores", cpu_cores);
-    info!("Main thread running on core {:?}", esp_idf_svc::hal::cpu::core());
-
-    // // Start I2S audio processing
-    info!("Initializing I2S audio processor (INMP441)...");
-    // ThreadSpawnConfiguration {
-    //     name: Some(b"audio-task\0"),
-    //     stack_size: 8192,
-    //     pin_to_core: Some(Core::Core0),
-    //     priority: 15,
-    //     ..Default::default()
-    // }.set()?;
-
-    // let audio_data_arc = audio::start_i2s_audio_task(
-    //     i2s,
-    //     sck_pin,
-    //     ws_pin,
-    //     sd_pin,
-    // )?;
-    let audio_data_arc = Arc::new(audio::AudioData::default());
-    let audio_data_clone = audio_data_arc.clone();
-    info!("Audio processor initialized and pinned to {:?}", esp_idf_svc::hal::cpu::core());
-
     let (producer, consumer) = unsafe { Q.split() };
     let producer = Arc::new(Mutex::new(producer));
+
+    let audio_data = Arc::new(Mutex::new(audio::AudioData::default()));
+     let audio_data_for_led = audio_data.clone();   // Clone cho LED task
+    let audio_data_for_audio = audio_data.clone(); // Clone cho audio task
 
     // Start HTTP server
     let _server = http::start_http_server(producer.clone())?;
@@ -133,12 +129,26 @@ fn main() -> anyhow::Result<()> {
     // Spawn LED thread on core 1
 
     thread::spawn(move || {
-        if let Err(e) = led_task(channel, led_pin, consumer, audio_data_clone) {
+        if let Err(e) = led_task(channel, led_pin, consumer, audio_data_for_led) {
             log::error!("LED task error: {:?}", e);
         }
     });
 
     info!("LED task spawned on Core 1");
+
+    ThreadSpawnConfiguration {
+            name: Some(b"audio-task\0"),
+            stack_size: 8192,  
+            pin_to_core: Some(Core::Core0),
+            priority: 15,  
+            ..Default::default()
+        }.set()?;
+
+    thread::spawn(move || {
+        if let Err(e) = audio_task(i2s, sck_pin, ws_pin, sd_pin, audio_data_for_audio) {
+            log::error!("Audio task error: {:?}", e);
+        }
+    });
 
     // Keep main thread alive
     loop {

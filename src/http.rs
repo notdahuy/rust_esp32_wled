@@ -1,11 +1,11 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use embedded_svc::http::Headers;
 use esp_idf_svc::http::server::{EspHttpServer, Configuration};
 use esp_idf_svc::io::{Read, Write};
-use crate::controller::EffectType;
+use crate::effect::EffectType;
 use log::{info, warn};
 use heapless::spsc::Producer;
-use heapless::Vec;
+use heapless::Vec as HeaplessVec;
 use std::sync::{Arc, Mutex};
 use core::fmt::Write as FmtWrite;
 
@@ -20,111 +20,154 @@ pub fn start_http_server(producer: Arc<Mutex<Producer<'static, LedCommand>>>) ->
     let config = Configuration::default();
     let mut server = EspHttpServer::new(&config)?;
     
-    info!("HTTP Server starting on port 80 (NO ALLOC Mode)");
+    info!("HTTP Server starting on port 80");
 
     const MAX_BODY_SIZE: usize = 512;
 
     server.fn_handler::<anyhow::Error, _>("/led", esp_idf_svc::http::Method::Post, move |mut req| {
         
-        // 1. Đọc body vào buffer (trên Stack)
+        // Read body into buffer
         let mut buf = [0u8; MAX_BODY_SIZE];
         let len = req.content_len().unwrap_or(0) as usize;
 
         if len == 0 || len > MAX_BODY_SIZE {
             let mut response = req.into_status_response(400)?;
-            // Phản hồi lỗi (no alloc)
             response.write_all(b"{\"status\":\"error\",\"message\":\"Invalid body length\"}")?;
             return Ok(());
         }
 
         req.read_exact(&mut buf[..len])?;
+        
         let body_str = match std::str::from_utf8(&buf[..len]) {
             Ok(s) => s,
             Err(_) => {
                 let mut response = req.into_status_response(400)?;
-                // Phản hồi lỗi (no alloc)
-                response.write_all(b"{\"status\":\"error\",\"message\":\"Invalid UTF-8 body\"}")?;
+                response.write_all(b"{\"status\":\"error\",\"message\":\"Invalid UTF-8\"}")?;
                 return Ok(());
             }
         };
-
-        // 2. TỰ PHÂN TÍCH (MANUAL PARSE)
         
-        let mut commands_to_send: Vec<LedCommand, 4> = Vec::new();
+        info!("Received: '{}'", body_str);
         
-        // Thay vì struct 'SuccessResponse', chúng ta lưu các giá trị phản hồi
-        // vào các biến trên Stack.
+        // Parse commands (support up to 4 commands per request)
+        let mut commands_to_send: HeaplessVec<LedCommand, 4> = HeaplessVec::new();
+        
+        // Response tracking
         let mut resp_mode: Option<&str> = None;
         let mut resp_brightness: Option<u8> = None;
         let mut resp_speed: Option<u8> = None;
-        let mut resp_color: Option<&str> = None; // Dùng &str (tham chiếu) thay vì String
+        let mut resp_color: Option<&str> = None;
 
-        info!("Parsing lightweight body (no alloc): '{}'", body_str);
-
+        // Parse form-urlencoded body: key=value&key=value
         for pair in body_str.split('&') {
             if let Some((key, value)) = pair.split_once('=') {
                 match key {
                     "mode" => {
                         let (effect, mode_str) = match value {
                             "static" => (EffectType::Static, "static"),
-                            "off" => (EffectType::Off, "off"),
                             "rainbow" => (EffectType::Rainbow, "rainbow"),
-                            _ => continue,
+                            "breathe" => (EffectType::Breathe, "breathe"),
+                            "colorwipe" => (EffectType::ColorWipe, "colorwipe"),
+                            "comet" => (EffectType::Comet, "comet"),
+                            "scanner" => (EffectType::Scanner, "scanner"),
+                            "theaterchase" => (EffectType::TheaterChase, "theaterchase"),
+                            "bounce" => (EffectType::Bounce, "bounce"),
+                            "volumebar" => (EffectType::AudioVolumeBar, "volumebar"),
+                            _ => {
+                                warn!("Unknown mode: {}", value);
+                                continue;
+                            }
                         };
-                        commands_to_send.push(LedCommand::SetEffect(effect));
-                        resp_mode = Some(mode_str); // Lưu &str
+                        
+                        // Prevent buffer overflow
+                        if commands_to_send.push(LedCommand::SetEffect(effect)).is_err() {
+                            warn!("Command buffer full, ignoring mode");
+                            continue;
+                        }
+                        resp_mode = Some(mode_str);
                     }
+                    
                     "brightness" => {
                         if let Ok(val) = value.parse::<u8>() {
                             let clamped = val.min(100);
                             let brightness_val = (clamped as f32) / 100.0;
-                            commands_to_send.push(LedCommand::SetBrightness(brightness_val));
+                            
+                            if commands_to_send.push(LedCommand::SetBrightness(brightness_val)).is_err() {
+                                warn!("Command buffer full, ignoring brightness");
+                                continue;
+                            }
                             resp_brightness = Some(clamped);
+                        } else {
+                            warn!("Invalid brightness value: {}", value);
                         }
                     }
+                    
                     "speed" => {
                         if let Ok(val) = value.parse::<u8>() {
-                            commands_to_send.push(LedCommand::SetSpeed(val));
+                            if commands_to_send.push(LedCommand::SetSpeed(val)).is_err() {
+                                warn!("Command buffer full, ignoring speed");
+                                continue;
+                            }
                             resp_speed = Some(val);
+                        } else {
+                            warn!("Invalid speed value: {}", value);
                         }
                     }
+                    
                     "color" => {
-                        if parse_hex_color(value).is_ok() {
-                            let (r, g, b) = parse_hex_color(value).unwrap(); // an toàn vì đã check
-                            commands_to_send.push(LedCommand::SetColor(r, g, b));
-                            resp_color = Some(value); // Lưu &str (vd: "FF00CC")
+                        match parse_hex_color(value) {
+                            Ok((r, g, b)) => {
+                                if commands_to_send.push(LedCommand::SetColor(r, g, b)).is_err() {
+                                    warn!("Command buffer full, ignoring color");
+                                    continue;
+                                }
+                                resp_color = Some(value);
+                                info!("Color parsed: #{:02X}{:02X}{:02X}", r, g, b);
+                            }
+                            Err(_) => {
+                                warn!("Invalid color format: {} (expected: RRGGBB)", value);
+                            }
                         }
                     }
-                    _ => {}
+                    
+                    _ => {
+                        warn!("Unknown parameter: {}", key);
+                    }
                 }
             }
         }
         
-        // 3. Gửi lệnh (Logic này không đổi và đã là 'no alloc')
+        // Send commands to LED task
         let mut send_success = true;
+        
         if !commands_to_send.is_empty() {
-            if let Ok(mut producer_guard) = producer.try_lock() {
-                for cmd in commands_to_send {
-                    if producer_guard.enqueue(cmd).is_err() {
-                        warn!("Command queue is full!");
-                        send_success = false; // Đánh dấu thất bại
-                        break;
+            match producer.try_lock() {
+                Ok(mut producer_guard) => {
+                    for cmd in commands_to_send {
+                        if producer_guard.enqueue(cmd).is_err() {
+                            warn!("⚠️ Command queue is FULL!");
+                            send_success = false;
+                            break;
+                        }
                     }
                 }
-            } else {
-                warn!("Mutex lock failed!");
-                send_success = false; // Đánh dấu thất bại
+                Err(_) => {
+                    warn!("⚠️ Mutex lock failed - concurrent access!");
+                    send_success = false;
+                }
             }
-        } 
+        } else {
+            warn!("No valid commands parsed from body");
+            send_success = false;
+        }
         
-        // 4. Trả về Response (Tự xây dựng JSON, 'no alloc')
+        // Build response
         if send_success {
             let mut response = req.into_ok_response()?;
             
-            // Tạo một String trên Stack
-            let mut resp_str = heapless::String::<128>::new(); 
+            // Build JSON response on stack (no heap allocation)
+            let mut resp_str = heapless::String::<256>::new();
             
-            // Tự xây dựng JSON bằng 'write!' (không cấp phát heap)
             write!(resp_str, "{{\"status\":\"ok\"").unwrap();
 
             if let Some(mode) = resp_mode {
@@ -142,38 +185,44 @@ pub fn start_http_server(producer: Arc<Mutex<Producer<'static, LedCommand>>>) ->
             
             write!(resp_str, "}}").unwrap();
             
-            // Ghi buffer từ Stack ra socket
+            info!("Response: {}", resp_str.as_str());
             response.write_all(resp_str.as_bytes())?;
 
         } else {
-            // THẤT BẠI: Trả về 503 (Service Unavailable)
             let mut response = req.into_status_response(503)?;
-            // Phản hồi lỗi (no alloc)
-            response.write_all(b"{\"status\":\"error\",\"message\":\"Device busy or queue full\"}")?;
+            response.write_all(b"{\"status\":\"error\",\"message\":\"Device busy or invalid params\"}")?;
         }
 
         Ok(())
     })?;
 
-    // Handler /status này vốn dĩ đã là 'no alloc'
     server.fn_handler::<anyhow::Error, _>("/status", esp_idf_svc::http::Method::Get, |req| {
         info!("Status requested");
         let mut response = req.into_ok_response()?;
-        response.write_all(b"{\"status\":\"ok\",\"device\":\"LED Controller\",\"version\":\"3.2-no-alloc\"}")?;
+        response.write_all(
+            b"{\"status\":\"ok\",\"device\":\"WS2812 Controller\",\"version\":\"3.3\",\"firmware\":\"esp32-rust\"}"
+        )?;
         Ok(())
     })?;
 
+    server.fn_handler::<anyhow::Error, _>("/led", esp_idf_svc::http::Method::Options, |req| {
+        let mut response = req.into_ok_response()?;
+        response.write_all(b"")?;
+        Ok(())
+    })?;
 
+    info!("✅ HTTP server configured successfully");
     Ok(server)
 }
 
-/// Hàm helper (không đổi, vốn dĩ đã là 'no alloc')
 fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), ()> {
     if s.len() != 6 {
         return Err(());
     }
+    
     let r = u8::from_str_radix(&s[0..2], 16).map_err(|_| ())?;
     let g = u8::from_str_radix(&s[2..4], 16).map_err(|_| ())?;
     let b = u8::from_str_radix(&s[4..6], 16).map_err(|_| ())?;
+    
     Ok((r, g, b))
 }

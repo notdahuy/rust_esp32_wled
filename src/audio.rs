@@ -1,284 +1,285 @@
-use esp_idf_hal::i2s::{self, config};
+use esp_idf_hal::i2s::{self, I2sDriver, config};
 use esp_idf_hal::gpio::*;
 use esp_idf_hal::i2s::I2S0;
-use log::{info, warn};
+use esp_idf_hal::delay::FreeRtos;
+use log::info;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use core::f32::consts::PI;
 
-/// Tuning parameters
-const SAMPLE_RATE: u32 = 16000;    // Recommended for LED-reactive: 16kHz
-const BUFFER_SIZE: usize = 128;    // bytes / 32-bit samples => 128 samples
-// Note: if you need 44100 Hz, set SAMPLE_RATE = 44100 and adjust filter cutoffs below.
+pub const SAMPLE_RATE: u32 = 16000;
+pub const BUFFER_SIZE: usize = 128;
+pub const NUM_BINS: usize = 8;
 
-/// Band cutoffs (Hz) - chosen for SAMPLE_RATE = 16k
-const BASS_CUTOFF: f32 = 250.0;    // <= 250Hz considered bass
-const MID_LOW: f32 = 250.0;        // mid band low edge
-const MID_HIGH: f32 = 3000.0;      // mid band high edge
-const TREBLE_CUTOFF: f32 = 3000.0; // > 3k treble
 
-/// AGC / envelope params
-const TARGET_LEVEL: f32 = 0.6;
-const AGC_ATTACK: f32 = 0.25;   // fast attack smoothing for envelope
-const AGC_RELEASE: f32 = 0.02;  // slower release smoothing
-const GAIN_MIN: f32 = 0.4;
-const GAIN_MAX: f32 = 15.0;
+const SMOOTH_FACTOR: f32 = 0.65;     
+const VOL_SCALE: f32 = 25.0;          
+const BASS_SCALE: f32 = 5.0;         
+const MID_SCALE: f32 = 4.0;           
+const TREBLE_SCALE: f32 = 6.0;        
 
-/// AudioData lock-free shared state
+const PORT_MAX_DELAY: u32 = 0xFFFFFFFF;
+
+// Noise gate - lọc nhiễu nền
+const NOISE_FLOOR: f32 = 0.005;       // Dưới ngưỡng này = nhiễu
+
+/// AudioData - lightweight
+#[derive(Debug, Clone)]
 pub struct AudioData {
-    amplitude: AtomicU32,
-    bass: AtomicU32,
-    mid: AtomicU32,
-    treble: AtomicU32,
+    pub volume: f32,
+    pub bass: f32,
+    pub mid: f32,
+    pub treble: f32,
+    pub bins: [f32; NUM_BINS],
 }
 
-impl AudioData {
-    pub fn new() -> Self {
+impl Default for AudioData {
+    fn default() -> Self {
         Self {
-            amplitude: AtomicU32::new(0),
-            bass: AtomicU32::new(0),
-            mid: AtomicU32::new(0),
-            treble: AtomicU32::new(0),
+            volume: 0.0,
+            bass: 0.0,
+            mid: 0.0,
+            treble: 0.0,
+            bins: [0.0; NUM_BINS],
         }
-    }
-
-    #[inline] fn set_amplitude(&self, v: f32) { self.amplitude.store(v.to_bits(), Ordering::Relaxed); }
-    #[inline] fn set_bass(&self, v: f32)      { self.bass.store(v.to_bits(), Ordering::Relaxed); }
-    #[inline] fn set_mid(&self, v: f32)       { self.mid.store(v.to_bits(), Ordering::Relaxed); }
-    #[inline] fn set_treble(&self, v: f32)    { self.treble.store(v.to_bits(), Ordering::Relaxed); }
-
-    #[inline] pub fn get_amplitude(&self) -> f32 { f32::from_bits(self.amplitude.load(Ordering::Relaxed)) }
-    #[inline] pub fn get_bass(&self) -> f32      { f32::from_bits(self.bass.load(Ordering::Relaxed)) }
-    #[inline] pub fn get_mid(&self) -> f32       { f32::from_bits(self.mid.load(Ordering::Relaxed)) }
-    #[inline] pub fn get_treble(&self) -> f32    { f32::from_bits(self.treble.load(Ordering::Relaxed)) }
-}
-
-impl Default for AudioData { fn default() -> Self { Self::new() } }
-
-/// First-order IIR helper (y[n] = a*y[n-1] + b*x[n])
-#[derive(Clone, Copy)]
-struct OnePole {
-    a: f32,
-    b: f32,
-    y: f32,
-}
-
-impl OnePole {
-    fn new(alpha: f32) -> Self { Self { a: alpha, b: 1.0 - alpha, y: 0.0 } }
-    fn apply(&mut self, x: f32) -> f32 {
-        self.y = self.a * self.y + self.b * x;
-        self.y
     }
 }
 
-/// Audio processor: zero-alloc, per-sample processing
-struct AudioProcessor {
-    data: Arc<AudioData>,
-
-    // smoothed display values
-    smooth_amp: f32,
-    smooth_bass: f32,
-    smooth_mid: f32,
-    smooth_treble: f32,
-
-    // AGC / envelope / gain
-    envelope: f32,
-    gain: f32,
-
-    // filters (lowpass for bass, band-pass via cascade)
-    lp_bass: OnePole,
-    lp_mid: OnePole,
-    lp_treble: OnePole,
-
-    // helper for mid band separation (we use hp = x - bass_lp)
-    prev_hp_mid: f32,
+/// Smooth value over time - faster response
+#[inline(always)]
+fn smooth(current: f32, target: f32, factor: f32) -> f32 {
+    current * factor + target * (1.0 - factor)
 }
 
-impl AudioProcessor {
-    fn new(data: Arc<AudioData>) -> Self {
-        // compute alpha for one-pole: alpha = exp(-2*pi*fc/fs)
-        fn alpha_for(fc: f32, fs: f32) -> f32 {
-            let x = (-2.0 * PI * fc / fs).exp();
-            // clamp to avoid NaN
-            if x.is_finite() { x as f32 } else { 0.0 }
-        }
+/// Clamp between 0.0 and 1.0
+#[inline(always)]
+fn clamp(v: f32) -> f32 {
+    if v < 0.0 { 0.0 } else if v > 1.0 { 1.0 } else { v }
+}
 
-        let fs = SAMPLE_RATE as f32;
-        let alpha_bass = alpha_for(BASS_CUTOFF, fs);    // smooth lowpass for bass
-        let alpha_mid = alpha_for((MID_LOW + MID_HIGH) * 0.5, fs); // mid smoother
-        let alpha_treble = alpha_for(TREBLE_CUTOFF, fs);
-
-        Self {
-            data,
-            smooth_amp: 0.0,
-            smooth_bass: 0.0,
-            smooth_mid: 0.0,
-            smooth_treble: 0.0,
-            envelope: 0.0,
-            gain: 1.0,
-            lp_bass: OnePole::new(alpha_bass),
-            lp_mid: OnePole::new(alpha_mid),
-            lp_treble: OnePole::new(alpha_treble),
-            prev_hp_mid: 0.0,
-        }
-    }
-
-    /// Process one 32-bit PCM sample (left channel). Normalized into [-1,1]
-    #[inline]
-    fn process_sample(&mut self, sample: i32) {
-        // normalize 32-bit sample
-        let x = (sample as f32) / 2147483648.0_f32;
-
-        // envelope (peak) follower with attack/release
-        let abs_x = x.abs();
-        if abs_x > self.envelope {
-            self.envelope = self.envelope * (1.0 - AGC_ATTACK) + abs_x * AGC_ATTACK;
-        } else {
-            self.envelope = self.envelope * (1.0 - AGC_RELEASE) + abs_x * AGC_RELEASE;
-        }
-
-        // update gain smoothly toward target
-        if self.envelope > 1e-6 {
-            let target_gain = TARGET_LEVEL / self.envelope;
-            self.gain = (self.gain * 0.98 + target_gain * 0.02).clamp(GAIN_MIN, GAIN_MAX);
-        }
-
-        // apply gain
-        let g_x = (x * self.gain).clamp(-1.0, 1.0);
-
-        // filter chain:
-        // bass low-pass
-        let bass = self.lp_bass.apply(g_x);
-        // high-pass approx for mid/treble: hp = g_x - bass
-        let hp = g_x - bass;
-
-        // mid band smoothing (a bit slower)
-        let mid = self.lp_mid.apply(hp);
-
-        // treble: remaining high-frequency (hp - mid)
-        let treble_raw = hp - mid;
-        let treble = self.lp_treble.apply(treble_raw);
-
-        // accumulate smoothing for display (exponential)
-        const DISP_ALPHA: f32 = 0.12;
-        // amplitude: use envelope scaled
-        let amp = (self.envelope * self.gain).min(1.0);
-        self.smooth_amp = self.smooth_amp * (1.0 - DISP_ALPHA) + amp * DISP_ALPHA;
-
-        // energies: take absolute (approximate magnitude)
-        let bass_val = bass.abs();
-        let mid_val = mid.abs();
-        let treble_val = treble.abs();
-
-        self.smooth_bass = self.smooth_bass * (1.0 - DISP_ALPHA) + bass_val * DISP_ALPHA;
-        self.smooth_mid  = self.smooth_mid  * (1.0 - DISP_ALPHA) + mid_val * DISP_ALPHA;
-        self.smooth_treble = self.smooth_treble * (1.0 - DISP_ALPHA) + treble_val * DISP_ALPHA;
-    }
-
-    /// Write smoothed values to shared atomic state (call periodically)
-    fn publish(&self) {
-        self.data.set_amplitude(self.smooth_amp);
-        self.data.set_bass(self.smooth_bass);
-        self.data.set_mid(self.smooth_mid);
-        self.data.set_treble(self.smooth_treble);
+/// Apply noise gate
+#[inline(always)]
+fn apply_noise_gate(value: f32, threshold: f32) -> f32 {
+    if value < threshold {
+        0.0
+    } else {
+        value
     }
 }
 
-/// Start I2S audio task (spawns std thread). Returns Arc<AudioData>
-pub fn start_i2s_audio_task(
+/// Calculate RMS (Root Mean Square) - measures volume
+#[inline]
+fn calculate_rms(samples: &[i32]) -> f32 {
+    let mut sum = 0.0f32;
+    for &s in samples.iter() {
+        let normalized = (s as f32) / (i32::MAX as f32);
+        sum += normalized * normalized;
+    }
+    (sum / samples.len() as f32).sqrt()
+}
+
+/// Simple zero-crossing rate - estimates pitch/frequency
+#[inline]
+fn calculate_zcr(samples: &[i32]) -> f32 {
+    let mut crossings = 0;
+    for i in 1..samples.len() {
+        if (samples[i] >= 0 && samples[i-1] < 0) || 
+           (samples[i] < 0 && samples[i-1] >= 0) {
+            crossings += 1;
+        }
+    }
+    crossings as f32 / samples.len() as f32
+}
+
+/// Simple spectral brightness approximation
+#[inline]
+fn calculate_spectral_brightness(samples: &[i32]) -> f32 {
+    let mut high_freq_energy = 0.0f32;
+    let mut low_freq_energy = 0.0f32;
+    
+    // Giảm threshold để nhạy hơn với treble
+    const THRESHOLD: i32 = i32::MAX / 20; // 5% threshold (giảm từ 10%)
+    
+    for i in 1..samples.len() {
+        let diff = (samples[i] - samples[i-1]).abs();
+        if diff > THRESHOLD {
+            high_freq_energy += diff as f32;
+        }
+        low_freq_energy += samples[i].abs() as f32;
+    }
+    
+    if low_freq_energy > 0.0 {
+        high_freq_energy / low_freq_energy
+    } else {
+        0.0
+    }
+}
+
+/// Simple frequency band detection using time-domain analysis
+fn analyze_frequency_bands(samples: &[i32]) -> (f32, f32, f32) {
+    let rms = calculate_rms(samples);
+    let zcr = calculate_zcr(samples);
+    let brightness = calculate_spectral_brightness(samples);
+    
+    // Điều chỉnh ngưỡng ZCR để nhạy hơn với bass
+    let bass = if zcr < 0.35 {  // Tăng từ 0.3
+        rms * (1.0 - zcr) * 1.2  // Thêm boost 20%
+    } else { 
+        rms * 0.3 
+    };
+    
+    let treble = rms * brightness * 1.3; // Boost treble thêm 30%
+    
+    let mid = rms - (bass + treble) * 0.5;
+    
+    (bass, mid.max(0.0), treble)
+}
+
+/// Generate simple frequency bins using windowed RMS
+fn generate_simple_bins(samples: &[i32], bins: &mut [f32; NUM_BINS]) {
+    let window_size = samples.len() / NUM_BINS;
+    
+    for i in 0..NUM_BINS {
+        let start = i * window_size;
+        let end = ((i + 1) * window_size).min(samples.len());
+        
+        if end > start {
+            let window = &samples[start..end];
+            bins[i] = calculate_rms(window);
+            
+            // Tăng trọng số cho bins cao (treble nhạy hơn)
+            let weight = 1.0 + (i as f32 / NUM_BINS as f32) * 0.8; // Tăng từ 0.5
+            bins[i] *= weight;
+        }
+    }
+}
+
+/// Peak detection for beat/transient detection - more sensitive
+#[inline]
+fn detect_peak(current: f32, history: &[f32; 4]) -> f32 {
+    let avg: f32 = history.iter().sum::<f32>() / history.len() as f32;
+    let threshold = avg * 1.3; // Giảm từ 1.5 → dễ phát hiện peak hơn
+    
+    if current > threshold {
+        (current - threshold) / threshold
+    } else {
+        0.0
+    }
+}
+
+/// Simple audio processing - More sensitive settings
+pub fn audio_processing_blocking(
     i2s: I2S0,
-    sck_pin: Gpio33,
-    ws_pin: Gpio25,
-    sd_pin: Gpio32,
-) -> Result<Arc<AudioData>, anyhow::Error> {
-    let audio_data = Arc::new(AudioData::new());
-    let audio_data_clone = audio_data.clone();
-
-    std::thread::spawn(move || {
-        if let Err(e) = run_audio_loop(i2s, sck_pin, ws_pin, sd_pin, audio_data) {
-            warn!("Audio task failed: {:?}", e);
-        }
-    });
-
-    Ok(audio_data_clone)
-}
-
-/// Main audio loop - zero-copy, blocking read, per-sample processing
-fn run_audio_loop(
-    i2s: I2S0,
-    sck_pin: Gpio33,
-    ws_pin: Gpio25,
-    sd_pin: Gpio32,
-    audio_data: Arc<AudioData>,
+    sck: Gpio33,
+    ws: Gpio25,
+    sd: Gpio32,
+    audio_data: Arc<std::sync::Mutex<AudioData>>,
 ) -> Result<(), anyhow::Error> {
-    info!("Starting audio capture task (optimized). Sample rate: {} Hz", SAMPLE_RATE);
-
     // I2S config
-    let channel_cfg = config::Config::default();
-    let clk_cfg = config::StdClkConfig::from_sample_rate_hz(SAMPLE_RATE);
-    let slot_cfg = config::StdSlotConfig::philips_slot_default(
-        config::DataBitWidth::Bits32,
-        config::SlotMode::Mono,
+    let config = config::StdConfig::philips(
+        SAMPLE_RATE,
+        config::DataBitWidth::Bits32
     );
-    let gpio_cfg = config::StdGpioConfig::default();
-
-    let i2s_config = config::StdConfig::new(channel_cfg, clk_cfg, slot_cfg, gpio_cfg);
-
-    // Initialize driver
-    let mut driver = i2s::I2sDriver::new_std_rx(
+    
+    let mut driver: I2sDriver<'_, i2s::I2sRx> = I2sDriver::new_std_rx(
         i2s,
-        &i2s_config,
-        sck_pin,
-        sd_pin,
+        &config,
+        sck,
+        sd,
         None::<Gpio0>,
-        ws_pin,
+        ws
     )?;
 
     driver.rx_enable()?;
 
-    // Reuse static buffers on stack (no allocations)
-    const BUFFER_BYTES: usize = BUFFER_SIZE * 4; // 4 bytes per sample (32-bit)
-    let mut buffer: [u8; BUFFER_BYTES] = [0u8; BUFFER_BYTES]; // read bytes
-    // temporary sample conversion per-read, we process per-sample immediately
-    let mut processor = AudioProcessor::new(audio_data.clone());
-
-    // We will publish display values at a lower rate to avoid too-frequent atomics.
-    // publish every N reads (approx every ~32..64 ms depending on buffer size).
-    let mut publish_counter: usize = 0;
-    let publish_interval_reads = 4usize; // tweak: 4 reads * BUFFER_SIZE / SAMPLE_RATE seconds
+    // Allocate buffers on heap
+    let mut raw_bytes = vec![0u8; BUFFER_SIZE * 4];
+    let mut samples = vec![0i32; BUFFER_SIZE];
+    
+    // Smoothed values
+    let mut smooth_volume = 0.0f32;
+    let mut smooth_bass = 0.0f32;
+    let mut smooth_mid = 0.0f32;
+    let mut smooth_treble = 0.0f32;
+    let mut smooth_bins = [0.0f32; NUM_BINS];
+    
+    // Peak detection history
+    let mut volume_history = [0.0f32; 4];
+    let mut history_idx = 0;
+    
+    info!("Audio processing started - SENSITIVE MODE");
+    info!("Sample rate: {}Hz, Buffer: {} samples", SAMPLE_RATE, BUFFER_SIZE);
+    info!("Scales - Vol:{} Bass:{} Mid:{} Treble:{}", 
+          VOL_SCALE, BASS_SCALE, MID_SCALE, TREBLE_SCALE);
 
     loop {
-        // Blocking read with moderate timeout (ms). Use 200 to avoid busy spin.
-        match driver.read(&mut buffer, 200) {
-            Ok(bytes_read) if bytes_read >= 4 => {
-                // convert each 4-byte little-endian to i32 and process immediately
-                let num_samples = bytes_read / 4;
-                for i in 0..num_samples {
-                    let base = i * 4;
-                    let sample = i32::from_le_bytes([
-                        buffer[base],
-                        buffer[base + 1],
-                        buffer[base + 2],
-                        buffer[base + 3],
-                    ]);
-                    processor.process_sample(sample);
-                }
+        // Read I2S data
+        if let Err(_) = driver.read(&mut *raw_bytes, PORT_MAX_DELAY) {
+            FreeRtos::delay_ms(10);
+            continue;
+        }
 
-                publish_counter = publish_counter.wrapping_add(1);
-                if publish_counter >= publish_interval_reads {
-                    publish_counter = 0;
-                    processor.publish();
-                }
-            }
-            Ok(_) => {
-                // no data - yield thread a bit
-                std::thread::yield_now();
-            }
-            Err(e) => {
-                warn!("I2S read error: {:?}", e);
-                // short sleep to avoid tight error loop
-                std::thread::sleep(std::time::Duration::from_millis(20));
+        // Convert bytes to i32 samples
+        for i in 0..BUFFER_SIZE {
+            let idx = i * 4;
+            samples[i] = i32::from_le_bytes([
+                raw_bytes[idx],
+                raw_bytes[idx + 1],
+                raw_bytes[idx + 2],
+                raw_bytes[idx + 3],
+            ]);
+        }
+
+        // Calculate volume (RMS)
+        let mut volume = calculate_rms(&samples) * VOL_SCALE;
+        volume = apply_noise_gate(volume, NOISE_FLOOR); // Lọc nhiễu
+        
+        // Frequency band analysis
+        let (mut bass, mut mid, mut treble) = analyze_frequency_bands(&samples);
+        
+        // Apply noise gate to bands
+        bass = apply_noise_gate(bass, NOISE_FLOOR);
+        mid = apply_noise_gate(mid, NOISE_FLOOR);
+        treble = apply_noise_gate(treble, NOISE_FLOOR);
+        
+        // Generate simple bins
+        let mut bins = [0.0f32; NUM_BINS];
+        generate_simple_bins(&samples, &mut bins);
+        
+        // Apply noise gate to bins
+        for bin in bins.iter_mut() {
+            *bin = apply_noise_gate(*bin, NOISE_FLOOR);
+        }
+        
+        // Peak detection for beat
+        volume_history[history_idx] = volume;
+        history_idx = (history_idx + 1) % volume_history.len();
+        let beat_intensity = detect_peak(volume, &volume_history);
+        
+        // Apply smoothing (faster response than before)
+        smooth_volume = smooth(smooth_volume, volume, SMOOTH_FACTOR);
+        smooth_bass = smooth(smooth_bass, bass * BASS_SCALE, SMOOTH_FACTOR);
+        smooth_mid = smooth(smooth_mid, mid * MID_SCALE, SMOOTH_FACTOR);
+        smooth_treble = smooth(smooth_treble, treble * TREBLE_SCALE, SMOOTH_FACTOR);
+        
+        for i in 0..NUM_BINS {
+            smooth_bins[i] = smooth(smooth_bins[i], bins[i], SMOOTH_FACTOR);
+        }
+        
+        // Beat boost (tăng từ 0.5 lên 0.7)
+        let beat_boost = 1.0 + beat_intensity * 0.7;
+
+        // Update shared data
+        if let Ok(mut data) = audio_data.lock() {
+            data.volume = clamp(smooth_volume * beat_boost);
+            data.bass = clamp(smooth_bass * beat_boost);
+            data.mid = clamp(smooth_mid);
+            data.treble = clamp(smooth_treble);
+            
+            for i in 0..NUM_BINS {
+                data.bins[i] = clamp(smooth_bins[i] * beat_boost);
             }
         }
+
+        // Fast update rate
+        FreeRtos::delay_ms(5);
     }
 }
