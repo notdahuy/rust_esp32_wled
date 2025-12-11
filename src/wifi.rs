@@ -27,9 +27,9 @@ pub fn wifi(
 
 
 
-    block_on(start_access_point(&mut wifi))?;
+    block_on(connect_to_wifi(&mut wifi))?;
 
-    let ip_info = wifi.wifi().ap_netif().get_ip_info()?;
+    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
 
     info!("Thông tin Wifi DHCP: {:?}", ip_info);
     

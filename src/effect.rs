@@ -3,7 +3,7 @@ use palette::{FromColor, Hsv, RgbHue, Srgb};
 use crate::audio::AudioData;
 use std::cell::RefCell;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 pub enum EffectType {
     Static,
     Rainbow,
@@ -21,21 +21,20 @@ pub trait Effect {
 
     fn update(&mut self, delta_us: u64) -> bool;
     
-
     fn render(&self, buffer: &mut [RGB8]);
 
-    fn render_audio(&mut self, buffer: &mut [RGB8], audio: &AudioData, now_us: u64) {
+    fn render_audio(&mut self, buffer: &mut [RGB8], _audio: &AudioData, _now_us: u64) {
         // Default: chỉ gọi render bình thường
         self.render(buffer);
     }
     
 
-    fn set_color(&mut self, color: RGB8) -> bool {
+    fn set_color(&mut self, _color: RGB8) -> bool {
         false 
     }
     
 
-    fn set_speed(&mut self, speed: u8) -> bool {
+    fn set_speed(&mut self, _speed: u8) -> bool {
         false 
     }
     
