@@ -1,306 +1,131 @@
 use std::sync::{Arc, Mutex}; 
 use esp_idf_sys::esp_timer_get_time;
-use log::{info, warn};
+use log::info;
 use smart_leds::RGB8;
 use ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriver;
 use crate::audio::AudioData;
-use crate::effect::*;
+use crate::effects::*;
 
 pub struct LedController<'a> {
     driver: Ws2812Esp32RmtDriver<'a>,
     num_leds: usize,
     brightness: u8,
-    last_brightness: u8,
-    
-    // Pre-allocated buffers 
     buffer: Vec<RGB8>,
     tx_buffer: Vec<u8>,
-    
-    // Timing
-    last_update: u64,
-    frame_interval: u64,
-    
-    // Effect system
     current_effect: Box<dyn Effect>,
-    needs_update: bool,
-    last_set_color: RGB8,
-    last_set_speed: u8,
-    
-    // Audio
     audio_data: Option<Arc<Mutex<AudioData>>>,
-    
-    // State
-    force_update_count: u8,
-    is_powered: bool,
-    
-    // Performance tracking
-    slow_write_count: u32,
-    last_write_us: u64,
+    next_update_time: Option<u64>,
 }
 
 impl<'a> LedController<'a> {
     pub fn new(driver: Ws2812Esp32RmtDriver<'a>, num_leds: usize) -> Self {
-        let default_color = RGB8 { r: 255, g: 255, b: 255 };
-        let default_speed = 128;
-        
-        // ✅ Pre-allocate tx_buffer to EXACT size (no future reallocs)
-        let mut tx_buffer = Vec::with_capacity(num_leds * 3);
-        unsafe { tx_buffer.set_len(num_leds * 3); }
-        
         Self {
             driver,
             num_leds,
             brightness: 255,
-            last_brightness: 255,
             buffer: vec![RGB8::default(); num_leds],
-            tx_buffer,
-            last_update: unsafe { esp_timer_get_time() } as u64,
-            frame_interval: 33_333, // ✅ 30 FPS (was 60)
-            current_effect: Box::new(StaticEffect::new(default_color)),
-            needs_update: true,
-            last_set_color: default_color,
-            last_set_speed: default_speed,
+            tx_buffer: vec![0u8; num_leds * 3],
+            current_effect: Box::new(StaticEffect::new(RGB8 { r: 150, g: 150, b: 0 })),
             audio_data: None,
-            force_update_count: 0,
-            is_powered: true,
-            slow_write_count: 0,
-            last_write_us: 0,
+            next_update_time: Some(0),
         }
     }
 
     pub fn set_audio_data(&mut self, audio_data: Arc<Mutex<AudioData>>) {
         self.audio_data = Some(audio_data);
-        info!("✅ Audio data connected");
     }
 
     pub fn set_brightness(&mut self, level: f32) {
-        let new_level = (level.clamp(0.0, 1.0) * 255.0).round() as u8;
-        
-        if self.brightness != new_level {
-            self.brightness = new_level;
-            self.last_brightness = new_level;
-            self.needs_update = true;
-            self.force_update_count = self.force_update_count.max(2);
-            info!("💡 Brightness: {}", new_level);
+        let new = (level.clamp(0.0, 1.0) * 255.0) as u8;
+        if self.brightness != new {
+            self.brightness = new;
         }
     }
 
-    pub fn set_color(&mut self, color: RGB8) {   
-        self.last_set_color = color;
-        if self.current_effect.set_color(color) {
-            self.needs_update = true;
-            self.force_update_count = self.force_update_count.max(2);
-            info!("🎨 Color: #{:02X}{:02X}{:02X}", color.r, color.g, color.b);
-        }
+    pub fn set_color(&mut self, color: RGB8) {
+        self.current_effect.set_color(color);
     }
-
+    
     pub fn set_speed(&mut self, speed: u8) {
-        self.last_set_speed = speed;
-        if self.current_effect.set_speed(speed) {
-            self.needs_update = true;
-            self.force_update_count = self.force_update_count.max(1);
-            info!("⚡ Speed: {}", speed);
-        }
+        self.current_effect.set_speed(speed);
     }
 
-    pub fn set_effect(&mut self, effect: EffectType) {
-        let new_effect: Box<dyn Effect> = match effect {
-            EffectType::Static => Box::new(StaticEffect::new(self.last_set_color)),
-            EffectType::Rainbow => Box::new(RainbowEffect::new(self.num_leds, self.last_set_speed)),
-            EffectType::Breathe => Box::new(BreatheEffect::new(self.last_set_color, self.last_set_speed)),
-            EffectType::ColorWipe => Box::new(ColorWipeEffect::new(self.last_set_color, self.last_set_speed, self.num_leds)),
-            EffectType::Comet => Box::new(CometEffect::new(self.last_set_color, self.last_set_speed, self.num_leds)),
-            EffectType::Scanner => Box::new(ScannerEffect::new(self.last_set_color, self.last_set_speed, self.num_leds)),
-            EffectType::TheaterChase => Box::new(TheaterChaseEffect::new(self.last_set_color, self.last_set_speed, self.num_leds)),
-            EffectType::Bounce => Box::new(BounceEffect::new(self.last_set_speed, self.num_leds)),
-            EffectType::AudioVolumeBar => Box::new(AudioVolumeBarEffect::new(self.last_set_color, self.num_leds)),
+    pub fn set_effect(&mut self, effect_type: EffectType) {
+        let color = self.current_effect.get_color()
+            .unwrap_or(RGB8 { r: 255, g: 255, b: 255 });
+        let speed = self.current_effect.get_speed().unwrap_or(128);
+
+        self.current_effect = match effect_type {
+            EffectType::Static => Box::new(StaticEffect::new(color)),
+            EffectType::Blink => Box::new(BlinkEffect::new(color, speed)),
+            EffectType::Rainbow => Box::new(RainbowEffect::new(speed)),
+            EffectType::VuMeter => Box::new(VuMeterEffect::new(self.num_leds, speed)),
+            EffectType::Breathe => Box::new(BreatheEffect::new(color, speed)),
+            EffectType::Comet => Box::new(CometEffect::new(color, speed, self.num_leds)),
+            EffectType::Sparkle => Box::new(SparkleEffect::new(color, speed)),
+            EffectType::Chase => Box::new(ChaseEffect::new(color, speed)),
+            EffectType::Fade => Box::new(FadeEffect::new(color, speed)),
+            EffectType::Scan => Box::new(ScanEffect::new(color, speed, self.num_leds)),
         };
-        
-        info!("✨ Effect: {}", new_effect.name());
-        self.current_effect = new_effect;
-        self.needs_update = true;
-        self.force_update_count = self.force_update_count.max(3);
+
+        info!("Effect: {}", self.current_effect.name());
     }
 
-    pub fn power_on(&mut self) {
-        if !self.is_powered {
-            self.is_powered = true;
-            self.brightness = self.last_brightness;
-            self.needs_update = true;
-            self.force_update_count = 2;
-            info!("💡 LED ON (brightness: {})", self.brightness);
+    pub fn needs_update(&self, now_us: u64) -> bool {
+        match self.next_update_time {
+            None => false,
+            Some(time) => now_us >= time,
         }
     }
 
-    pub fn power_off(&mut self) {
-        if self.is_powered {
-            self.is_powered = false;
-            self.last_brightness = self.brightness;
-            self.brightness = 0;
-            self.needs_update = true;
-            self.force_update_count = 1;
-            self.update_display_fast(); // ✅ Immediate off
-            info!("🔌 LED OFF");
-        }
-    }
-
-
-    pub fn update(&mut self) {
-        // Skip if powered off and no forced updates
-        if !self.is_powered && self.force_update_count == 0 {
-            return;
-        }
-
-        let now = unsafe { esp_timer_get_time() } as u64;
-        
-        // ✅ 30 FPS frame rate limiting (was 60)
-        if self.force_update_count == 0 && now - self.last_update < self.frame_interval {
-            return;
-        }
-        
-        let delta_us = now.saturating_sub(self.last_update);
-        self.last_update = now;
-
-        // ✅ Update effect state
-        if self.current_effect.update(delta_us) {
-            self.needs_update = true;
-        }
-
-        // ✅ Render and write if needed
-        if self.needs_update || self.force_update_count > 0 {
-            self.render_current_effect(now);
-            self.update_display_optimized();
-            
-            self.needs_update = false;
-            
-            if self.force_update_count > 0 {
-                self.force_update_count -= 1;
+    pub fn get_delay_ms(&self, now_us: u64) -> u32 {
+        match self.next_update_time {
+            None => 10,
+            Some(time) => {
+                if now_us >= time {
+                    1
+                } else {
+                    let us = time - now_us;
+                    ((us / 1000).min(10)) as u32
+                }
             }
         }
     }
 
-    /// ✅ Render with optimized audio locking
-    fn render_current_effect(&mut self, now: u64) {
-        if self.current_effect.is_audio_reactive() {
+    pub fn update(&mut self, now_us: u64) {
+        let next_time = if self.current_effect.is_audio_reactive() {
             if let Some(ref audio_data) = self.audio_data {
-                // ✅ try_lock with timeout fallback
-                if let Ok(audio) = audio_data.try_lock() {
-                    self.current_effect.render_audio(&mut self.buffer, &audio, now);
+                if let Ok(audio) = audio_data.lock() {
+                    self.current_effect.update_audio(now_us, &audio, &mut self.buffer)
                 } else {
-                    // Lock failed - render without audio (no blocking!)
-                    self.current_effect.render(&mut self.buffer);
+                    Some(now_us + 1000)
                 }
             } else {
-                self.current_effect.render(&mut self.buffer);
+                None
             }
         } else {
-            self.current_effect.render(&mut self.buffer);
-        }
+            self.current_effect.update(now_us, &mut self.buffer)
+        };
+        
+        self.next_update_time = next_time;
+        self.render();
     }
 
-    /// ✅ OPTIMIZED: Fast display update with bit-shift (no 64KB LUT!)
-    fn update_display_optimized(&mut self) {
-        let write_start = unsafe { esp_timer_get_time() } as u64;
-        
-        let brightness = self.brightness;
-        let num_leds = self.num_leds;
-        
-        // ✅ Use bit-shift instead of 64KB LUT (compiler optimizes this well)
-        match brightness {
-            255 => {
-                // Full brightness - direct copy (fastest path)
-                let mut idx = 0;
-                for pixel in &self.buffer[..num_leds] {
-                    self.tx_buffer[idx] = pixel.g;
-                    self.tx_buffer[idx + 1] = pixel.r;
-                    self.tx_buffer[idx + 2] = pixel.b;
-                    idx += 3;
-                }
-            }
-            0 => {
-                // Off - memset to zero (very fast)
-                self.tx_buffer[..num_leds * 3].fill(0);
-            }
-            _ => {
-                // ✅ Bit-shift scaling (faster than LUT, uses zero extra RAM)
-                let mut idx = 0;
-                let brightness_u16 = brightness as u16;
-                
-                for pixel in &self.buffer[..num_leds] {
-                    self.tx_buffer[idx] = ((pixel.g as u16 * brightness_u16) >> 8) as u8;
-                    self.tx_buffer[idx + 1] = ((pixel.r as u16 * brightness_u16) >> 8) as u8;
-                    self.tx_buffer[idx + 2] = ((pixel.b as u16 * brightness_u16) >> 8) as u8;
-                    idx += 3;
-                }
-            }
+    fn render(&mut self) {
+        let brightness = self.brightness as u16;
+
+        for (i, pixel) in self.buffer.iter().enumerate() {
+            let base = i * 3;
+            
+            let r = (pixel.r as u16 * brightness / 255) as u8;
+            let g = (pixel.g as u16 * brightness / 255) as u8;
+            let b = (pixel.b as u16 * brightness / 255) as u8;
+
+            self.tx_buffer[base] = g;
+            self.tx_buffer[base + 1] = r;
+            self.tx_buffer[base + 2] = b;
         }
 
-        // ✅ Write to LEDs
-        if let Err(e) = self.driver.write_blocking(self.tx_buffer.iter().cloned()) {
-            warn!("⚠️ LED write error: {:?}", e);
-        }
-        
-        // ✅ Performance monitoring
-        let write_duration = unsafe { esp_timer_get_time() } as u64 - write_start;
-        self.last_write_us = write_duration;
-        
-        if write_duration > 2000 { // > 2ms is slow
-            self.slow_write_count += 1;
-            if self.slow_write_count % 30 == 0 {
-                warn!("⚠️ Slow RMT write: {}μs ({}x)", write_duration, self.slow_write_count);
-            }
-        }
-    }
-
-    /// Fast update for immediate changes (power off)
-    fn update_display_fast(&mut self) {
-        let brightness = self.brightness;
-        
-        if brightness == 0 {
-            self.tx_buffer[..self.num_leds * 3].fill(0);
-        } else {
-            self.update_display_optimized();
-            return;
-        }
-        
         let _ = self.driver.write_blocking(self.tx_buffer.iter().cloned());
     }
-
-    /// Direct write (bypass effects) - for testing
-    pub fn write_direct(&mut self, buffer: &[RGB8]) {
-        let mut idx = 0;
-        for pixel in &buffer[..self.num_leds.min(buffer.len())] {
-            self.tx_buffer[idx] = pixel.g;
-            self.tx_buffer[idx + 1] = pixel.r;
-            self.tx_buffer[idx + 2] = pixel.b;
-            idx += 3;
-        }
-        
-        let _ = self.driver.write_blocking(self.tx_buffer.iter().cloned());
-    }
-
-    pub fn get_status(&self) -> LedStatus {
-        LedStatus {
-            is_powered: self.is_powered,
-            brightness: self.brightness,
-            effect_name: self.current_effect.name().to_string(),
-            num_leds: self.num_leds,
-            last_color: self.last_set_color,
-            last_speed: self.last_set_speed,
-            last_write_us: self.last_write_us,
-            slow_writes: self.slow_write_count,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LedStatus {
-    pub is_powered: bool,
-    pub brightness: u8,
-    pub effect_name: String,
-    pub num_leds: usize,
-    pub last_color: RGB8,
-    pub last_speed: u8,
-    pub last_write_us: u64,
-    pub slow_writes: u32,
 }

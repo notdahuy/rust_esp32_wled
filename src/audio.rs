@@ -10,16 +10,16 @@ pub const BUFFER_SIZE: usize = 128;
 pub const NUM_BINS: usize = 8;
 
 
-const SMOOTH_FACTOR: f32 = 0.65;     
-const VOL_SCALE: f32 = 25.0;          
-const BASS_SCALE: f32 = 5.0;         
-const MID_SCALE: f32 = 4.0;           
-const TREBLE_SCALE: f32 = 6.0;        
+const SMOOTH_FACTOR: f32 = 0.45;     
+const VOL_SCALE: f32 = 20.0;          
+const BASS_SCALE: f32 = 4.5;         
+const MID_SCALE: f32 = 3.5;           
+const TREBLE_SCALE: f32 = 5.0;        
 
 const PORT_MAX_DELAY: u32 = 0xFFFFFFFF;
 
 // Noise gate - lọc nhiễu nền
-const NOISE_FLOOR: f32 = 0.005;       // Dưới ngưỡng này = nhiễu
+const NOISE_FLOOR: f32 = 0.012;       // Dưới ngưỡng này = nhiễu
 
 /// AudioData - lightweight
 #[derive(Debug, Clone)]
@@ -96,7 +96,7 @@ fn calculate_spectral_brightness(samples: &[i32]) -> f32 {
     let mut low_freq_energy = 0.0f32;
     
     // Giảm threshold để nhạy hơn với treble
-    const THRESHOLD: i32 = i32::MAX / 20; // 5% threshold (giảm từ 10%)
+    const THRESHOLD: i32 = i32::MAX / 5000; // 5% threshold (giảm từ 10%)
     
     for i in 1..samples.len() {
         let diff = (samples[i] - samples[i-1]).abs();
@@ -120,10 +120,11 @@ fn analyze_frequency_bands(samples: &[i32]) -> (f32, f32, f32) {
     let brightness = calculate_spectral_brightness(samples);
     
     // Điều chỉnh ngưỡng ZCR để nhạy hơn với bass
-    let bass = if zcr < 0.35 {  // Tăng từ 0.3
-        rms * (1.0 - zcr) * 1.2  // Thêm boost 20%
+    let bass = if zcr < 0.4 {  // Tăng từ 0.3
+        let bass_factor = (1.0 - (zcr / 0.4)).max(0.3);
+        rms * bass_factor * 1.1   // Thêm boost 20%
     } else { 
-        rms * 0.3 
+        rms * 0.25
     };
     
     let treble = rms * brightness * 1.3; // Boost treble thêm 30%
@@ -154,12 +155,12 @@ fn generate_simple_bins(samples: &[i32], bins: &mut [f32; NUM_BINS]) {
 
 /// Peak detection for beat/transient detection - more sensitive
 #[inline]
-fn detect_peak(current: f32, history: &[f32; 4]) -> f32 {
+fn detect_peak(current: f32, history: &[f32; 8]) -> f32 {
     let avg: f32 = history.iter().sum::<f32>() / history.len() as f32;
-    let threshold = avg * 1.3; // Giảm từ 1.5 → dễ phát hiện peak hơn
+    let threshold = avg * 1.4; // Giảm từ 1.5 → dễ phát hiện peak hơn
     
-    if current > threshold {
-        (current - threshold) / threshold
+    if current > threshold && avg > 0.01 {
+        ((current - threshold) / threshold).min(1.0)
     } else {
         0.0
     }
@@ -202,7 +203,7 @@ pub fn audio_processing_blocking(
     let mut smooth_bins = [0.0f32; NUM_BINS];
     
     // Peak detection history
-    let mut volume_history = [0.0f32; 4];
+    let mut volume_history = [0.0f32; 8];
     let mut history_idx = 0;
     
     info!("Audio processing started - SENSITIVE MODE");
@@ -265,21 +266,18 @@ pub fn audio_processing_blocking(
         }
         
         // Beat boost (tăng từ 0.5 lên 0.7)
-        let beat_boost = 1.0 + beat_intensity * 0.7;
+        let beat_boost = 1.0 + beat_intensity * 0.4;
 
-        // Update shared data
-        if let Ok(mut data) = audio_data.lock() {
+        // Update shared data với retry mechanism
+        if let Ok(mut data) = audio_data.try_lock() {
             data.volume = clamp(smooth_volume * beat_boost);
-            data.bass = clamp(smooth_bass * beat_boost);
-            data.mid = clamp(smooth_mid);
+            data.bass   = clamp(smooth_bass * beat_boost);
+            data.mid    = clamp(smooth_mid);
             data.treble = clamp(smooth_treble);
-            
+
             for i in 0..NUM_BINS {
                 data.bins[i] = clamp(smooth_bins[i] * beat_boost);
             }
         }
-
-        // Fast update rate
-        FreeRtos::delay_ms(5);
     }
 }

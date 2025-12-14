@@ -1,954 +1,493 @@
+use std::collections::HashMap;
+
+use once_cell::sync::Lazy;
 use smart_leds::RGB8;
 use palette::{FromColor, Hsv, RgbHue, Srgb};
 use crate::audio::AudioData;
-use std::cell::RefCell;
+
+pub static EFFECT_REGISTRY: Lazy<HashMap<&'static str, EffectType>> = Lazy::new(|| {
+    let mut m = HashMap::new();
+
+    m.insert("static",  EffectType::Static);
+    m.insert("blink",   EffectType::Blink);
+    m.insert("rainbow", EffectType::Rainbow);
+    m.insert("vu",       EffectType::VuMeter);
+    m
+});
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum EffectType {
     Static,
+    Blink,
     Rainbow,
-    Breathe,
-    ColorWipe,
-    Comet,
-    Scanner,
-    TheaterChase,
-    Bounce,  
-    AudioVolumeBar   
+    VuMeter
 }
 
 /// Trait chung cho tất cả các hiệu ứng
 pub trait Effect {
+    fn update(&mut self, now_us: u64, buffer: &mut [RGB8]) -> Option<u64>;
 
-    fn update(&mut self, delta_us: u64) -> bool;
-    
-    fn render(&self, buffer: &mut [RGB8]);
+    fn set_color(&mut self, _color: RGB8) {}
+    fn set_speed(&mut self, _speed: u8) {}
 
-    fn render_audio(&mut self, buffer: &mut [RGB8], _audio: &AudioData, _now_us: u64) {
-        // Default: chỉ gọi render bình thường
-        self.render(buffer);
-    }
-    
+    fn get_color(&self) -> Option<RGB8> { None }
+    fn get_speed(&self) -> Option<u8> { None }
 
-    fn set_color(&mut self, _color: RGB8) -> bool {
-        false 
-    }
-    
-
-    fn set_speed(&mut self, _speed: u8) -> bool {
-        false 
-    }
-    
-    fn name(&self) -> &'static str;
     fn is_audio_reactive(&self) -> bool { false }
+    
+    /// Update effect với audio data (chỉ cho audio-reactive effects)
+    /// Default implementation để các non-audio effects không cần implement
+    fn update_audio(&mut self, now_us: u64, audio: &AudioData, buffer: &mut [RGB8]) -> Option<u64> {
+        // Default: gọi update() thông thường và ignore audio data
+        let _ = audio;
+        self.update(now_us, buffer)
+    }
+
+    fn name(&self) -> &str;
 }
 
 
 pub struct StaticEffect {
     color: RGB8,
+    needs_initial_render: bool,
 }
 
 impl StaticEffect {
-    pub fn new(color: RGB8) -> Self { 
-        Self { color } 
+    pub fn new(color: RGB8) -> Self {
+        Self { 
+            color, 
+            needs_initial_render: true, // Cần render lần đầu
+        }
     }
 }
 
 impl Effect for StaticEffect {
-    fn name(&self) -> &'static str { "Static" }
-
-    fn update(&mut self, _delta_us: u64,) -> bool {
-        false  // Static không bao giờ tự update
+    fn update(&mut self, _now_us: u64, buffer: &mut [RGB8]) -> Option<u64> {
+        // Chỉ render nếu cần thiết (lần đầu hoặc sau khi đổi màu)
+        if self.needs_initial_render {
+            buffer.fill(self.color);
+            self.needs_initial_render = false;
+            
+            // Đã render xong, không cần update nữa cho đến khi có thay đổi
+            // Trả về None = "đừng gọi tôi nữa cho đến khi có lệnh mới"
+            return None;
+        }
+        
+        // Không nên đến đây vì controller chỉ gọi khi cần
+        // Nhưng nếu có gọi thì cũng không cần update gì
+        None
     }
 
-    fn render(&self, buffer: &mut [RGB8]) {
-        buffer.fill(self.color);
-    }
-
-    fn set_color(&mut self, color: RGB8) -> bool {
+    fn set_color(&mut self, color: RGB8) {
         if self.color != color {
             self.color = color;
-            return true;  // Cần render ngay
+            // Đánh dấu cần render lại với màu mới
+            self.needs_initial_render = true;
         }
-        false
+    }
+
+    fn get_color(&self) -> Option<RGB8> {
+        Some(self.color)
+    }
+
+    fn name(&self) -> &str {
+        "Static"
     }
 }
 
-
 pub struct RainbowEffect {
-    phase16: u16,
     speed: u8,
-    phase_spacing: u16,
-    lut: Vec<RGB8>,
+    
+    // Animation state - SỬ DỤNG ABSOLUTE TIME
+    start_time: u64,        // Thời điểm effect bắt đầu (microseconds)
+    hue_delta: f32,         // Khoảng cách màu giữa các LED liền kề
+    
+    // FPS control
+    target_frame_time_us: u64, // Thời gian giữa các frame (microseconds)
 }
 
 impl RainbowEffect {
-    pub fn new(num_leds: usize, speed: u8) -> Self {
-        let mut lut = Vec::with_capacity(256);
+    pub fn new(speed: u8) -> Self {
+        // Target 30 FPS cho rainbow effect (đủ mượt mà không tốn tài nguyên)
+        let target_fps = 30;
+        let target_frame_time_us = 1_000_000 / target_fps;
         
-        for i in 0..=255 {
-            let hue = (i as f32 * 360.0) / 256.0;
-            let color = Hsv::new(RgbHue::from_degrees(hue), 1.0, 1.0);
-            let srgb: Srgb = Srgb::from_color(color);
-
-            lut.push(RGB8 {
-                r: (srgb.red * 255.0).round() as u8,
-                g: (srgb.green * 255.0).round() as u8,
-                b: (srgb.blue * 255.0).round() as u8,
-            });
-        }
-
         Self {
-            phase16: 0,
             speed: speed.clamp(1, 255),
-            phase_spacing: (65536_u32 / num_leds.max(1) as u32) as u16,
-            lut,
+            start_time: 0, // Sẽ được set ở lần update đầu tiên
+            hue_delta: 360.0 / 144.0, // 144 LED, mỗi LED cách nhau 2.5 độ màu
+            target_frame_time_us,
         }
+    }
+    
+    /// Tính tốc độ thay đổi màu dựa trên speed (degrees per second)
+    fn hue_speed(&self) -> f32 {
+        // Speed 1 = chậm nhất (10 độ/giây = 36 giây cho một vòng cầu vồng)
+        // Speed 255 = nhanh nhất (360 độ/giây = 1 giây cho một vòng cầu vồng)
+        let min_speed = 10.0;   // degrees per second
+        let max_speed = 360.0;  // degrees per second
+        min_speed + (self.speed as f32 / 255.0) * (max_speed - min_speed)
     }
 }
 
 impl Effect for RainbowEffect {
-    fn name(&self) -> &'static str { "Rainbow" }
-
-    fn update(&mut self, delta_us: u64) -> bool {
-        // Tính phase increment với overflow protection
-        let increment = ((self.speed as u64).saturating_mul(delta_us)) / 10000;
-        
-        // Chỉ update nếu có thay đổi
-        if increment > 0 {
-            self.phase16 = self.phase16.wrapping_add(increment as u16);
-            return true;  // Phase thay đổi → cần render
+    fn update(&mut self, now_us: u64, buffer: &mut [RGB8]) -> Option<u64> {
+        // Lần đầu tiên được gọi - khởi tạo start_time
+        if self.start_time == 0 {
+            self.start_time = now_us;
         }
         
-        false  // Không thay đổi (delta_us quá nhỏ)
-    }
-
-    fn render(&self, buffer: &mut [RGB8]) {
+        // Tính elapsed time từ khi bắt đầu (ABSOLUTE TIME)
+        // Cách này loại bỏ hoàn toàn accumulation error
+        let elapsed_sec = (now_us - self.start_time) as f32 / 1_000_000.0;
+        
+        // Tính hue offset dựa trên elapsed time và speed
+        // Công thức: hue = (speed * time) % 360
+        // Điều này đảm bảo animation luôn mượt mà và chính xác
+        let hue_offset = (self.hue_speed() * elapsed_sec) % 360.0;
+        
+        // Render rainbow vào buffer
         for (i, pixel) in buffer.iter_mut().enumerate() {
-            let pixel_phase = self.phase16
-                .wrapping_add((i as u16).wrapping_mul(self.phase_spacing));
-            let hue_index = (pixel_phase >> 8) as u8;
-            *pixel = self.lut[hue_index as usize];
+            // Tính hue cho LED này dựa trên vị trí và offset toàn cục
+            let hue = (hue_offset + (i as f32 * self.hue_delta)) % 360.0;
+            
+            // Chuyển từ HSV sang RGB
+            // Saturation = 1.0 (màu thuần, không pha trắng)
+            // Value = 1.0 (độ sáng tối đa, brightness sẽ được apply bởi controller)
+            let hsv = Hsv::new(RgbHue::from_degrees(hue), 1.0, 1.0);
+            let rgb = Srgb::from_color(hsv);
+            
+            // Convert sang RGB8
+            pixel.r = (rgb.red * 255.0) as u8;
+            pixel.g = (rgb.green * 255.0) as u8;
+            pixel.b = (rgb.blue * 255.0) as u8;
+        }
+        
+        // Trả về thời điểm cần update tiếp theo (30 FPS)
+        Some(now_us + self.target_frame_time_us)
+    }
+
+    fn set_speed(&mut self, speed: u8) {
+        let new_speed = speed.clamp(1, 255);
+        if self.speed != new_speed {
+            // Khi thay đổi speed, ta cần điều chỉnh start_time để animation
+            // tiếp tục mượt mà từ vị trí hiện tại thay vì nhảy đột ngột
+            // 
+            // Tính hue_offset hiện tại dựa trên speed cũ
+            let now_us = unsafe { esp_idf_sys::esp_timer_get_time() } as u64;
+            let elapsed_sec = (now_us - self.start_time) as f32 / 1_000_000.0;
+            let current_hue = (self.hue_speed() * elapsed_sec) % 360.0;
+            
+            // Cập nhật speed
+            self.speed = new_speed;
+            
+            // Tính lại start_time sao cho với speed mới, ta vẫn ở cùng hue hiện tại
+            // current_hue = new_speed * (now - new_start_time)
+            // => new_start_time = now - (current_hue / new_speed)
+            let time_to_current_hue = current_hue / self.hue_speed();
+            self.start_time = now_us - (time_to_current_hue * 1_000_000.0) as u64;
         }
     }
-    
-    fn set_speed(&mut self, speed: u8) -> bool {
-        self.speed = speed.clamp(1, 255);
-        false  // Speed không cần render ngay
+
+    fn get_speed(&self) -> Option<u8> {
+        Some(self.speed)
+    }
+
+    fn name(&self) -> &str {
+        "Rainbow"
     }
 }
 
-
-pub struct BreatheEffect {
-    base_color: RGB8,
-    current_color: RGB8,
+pub struct BlinkEffect {
+    on: RGB8,
+    off: RGB8,
     speed: u8,
-    phase16: u16,
-    lut: Vec<u8>,
+    
+    // State tracking
+    current_state: bool, // true = ON, false = OFF
+    next_transition_time: u64, // Thời điểm chuyển trạng thái tiếp theo
+    cycle_time_us: u64, // Độ dài một chu kỳ (ON + OFF)
 }
 
-impl BreatheEffect {
+impl BlinkEffect {
     pub fn new(color: RGB8, speed: u8) -> Self {
-        let mut lut = Vec::with_capacity(256);
+        let cycle_time = cycle_time_us(speed);
         
-        // Tạo LUT sóng sin
-        for i in 0..=255 {
-            let rad = (i as f32 / 255.0) * std::f32::consts::PI;
-            let sin_val = rad.sin();
-            let brightness = (sin_val * 255.0).round() as u8;
-            lut.push(brightness);
-        }
-
         Self {
-            base_color: color,
-            current_color: RGB8::default(),
+            on: color,
+            off: RGB8::default(),
             speed: speed.clamp(1, 255),
-            phase16: 0,
-            lut,
+            current_state: true, // Bắt đầu với ON
+            next_transition_time: 0, // Sẽ được set ở lần update đầu tiên
+            cycle_time_us: cycle_time,
         }
     }
-}
-
-impl Effect for BreatheEffect {
-    fn name(&self) -> &'static str { "Breathe" }
-
-    fn update(&mut self, delta_us: u64) -> bool {
-        let increment = ((self.speed as u64).saturating_mul(delta_us)) / 10000;
+    
+    /// Tính thời điểm chuyển trạng thái tiếp theo dựa trên thời gian hiện tại
+    fn calculate_next_transition(&self, now_us: u64) -> u64 {
+        let half_cycle = self.cycle_time_us / 2;
         
-        if increment > 0 {
-            self.phase16 = self.phase16.wrapping_add(increment as u16);
-            
-            // Tính màu mới
-            let brightness_index = (self.phase16 >> 8) as u8;
-            let brightness_scale = self.lut[brightness_index as usize] as u16;
-
-            let new_color = RGB8 {
-                r: ((self.base_color.r as u16 * brightness_scale) >> 8) as u8,
-                g: ((self.base_color.g as u16 * brightness_scale) >> 8) as u8,
-                b: ((self.base_color.b as u16 * brightness_scale) >> 8) as u8,
-            };
-            
-            // Chỉ render nếu màu thực sự thay đổi
-            if self.current_color != new_color {
-                self.current_color = new_color;
-                return true;
-            }
-        }
+        // Tìm chu kỳ hiện tại
+        let current_cycle = now_us / self.cycle_time_us;
+        let phase = now_us % self.cycle_time_us;
         
-        false
-    }
-
-    fn render(&self, buffer: &mut [RGB8]) {
-        buffer.fill(self.current_color);
-    }
-
-    fn set_color(&mut self, color: RGB8) -> bool {
-        if self.base_color != color {
-            self.base_color = color;
-            return true;  // Màu base đổi → cần render ngay
-        }
-        false
-    }
-
-    fn set_speed(&mut self, speed: u8) -> bool {
-        self.speed = speed.clamp(1, 255);
-        false
-    }
-}
-
-
-pub struct ColorWipeEffect {
-    color: RGB8,
-    num_leds: usize,
-    current_pixel: usize,
-    time_accumulator: u64,
-    pixel_interval_us: u64,
-}
-
-impl ColorWipeEffect {
-    pub fn new(color: RGB8, speed: u8, num_leds: usize) -> Self {
-        Self {
-            color,
-            num_leds,
-            current_pixel: 0,
-            time_accumulator: 0,
-            pixel_interval_us: Self::map_speed_to_interval(speed),
-        }
-    }
-
-    fn map_speed_to_interval(speed: u8) -> u64 {
-        let inverted_speed = 256 - speed.max(1) as u64;
-        let interval_ms = (inverted_speed * 148) / 254 + 2;
-        interval_ms * 1000
-    }
-}
-
-impl Effect for ColorWipeEffect {
-    fn name(&self) -> &'static str { "Color Wipe" }
-
-    fn update(&mut self, delta_us: u64) -> bool {
-        self.time_accumulator += delta_us;
-
-        if self.time_accumulator >= self.pixel_interval_us {
-            self.time_accumulator -= self.pixel_interval_us;  // Giữ phần dư
-            
-            self.current_pixel += 1;
-
-            if self.current_pixel > self.num_leds {
-                self.current_pixel = 0;
-            }
-            
-            return true;  // Pixel mới → cần render
-        }
-        
-        false  // Chưa đến lúc update
-    }
-
-    fn render(&self, buffer: &mut [RGB8]) {
-        if self.current_pixel == 0 {
-            // Reset: tắt tất cả
-            buffer.fill(RGB8::default());
+        // Tính thời điểm chuyển trạng thái tiếp theo
+        if phase < half_cycle {
+            // Đang ở nửa đầu (ON), chuyển sang OFF sau khi hết nửa đầu
+            current_cycle * self.cycle_time_us + half_cycle
         } else {
-            // Bật từ pixel 0 đến current_pixel - 1
-            let lit_count = self.current_pixel.min(buffer.len());
+            // Đang ở nửa sau (OFF), chuyển sang ON ở chu kỳ tiếp theo
+            (current_cycle + 1) * self.cycle_time_us
+        }
+    }
+}
+
+fn cycle_time_us(speed: u8) -> u64 {
+    // Speed 1..255 → cycle time ~2000ms .. ~50ms
+    // Tốc độ càng cao, chu kỳ càng ngắn, blink càng nhanh
+    let min = 50_000;
+    let max = 2_000_000;
+    max - (speed as u64 * (max - min) / 255)
+}
+
+impl Effect for BlinkEffect {
+    fn update(&mut self, now_us: u64, buffer: &mut [RGB8]) -> Option<u64> {
+        // Lần đầu tiên được gọi, khởi tạo next_transition_time
+        if self.next_transition_time == 0 {
+            // Render trạng thái ban đầu (ON)
+            buffer.fill(self.on);
             
-            // Fill phần sáng
-            buffer[..lit_count].fill(self.color);
+            // Tính thời điểm chuyển sang OFF
+            let half_cycle = self.cycle_time_us / 2;
+            self.next_transition_time = now_us + half_cycle;
             
-            // Fill phần tối (nếu có)
-            if lit_count < buffer.len() {
-                buffer[lit_count..].fill(RGB8::default());
+            // Trả về thời điểm cần update tiếp theo
+            return Some(self.next_transition_time);
+        }
+        
+        // Kiểm tra xem đã đến lúc chuyển trạng thái chưa
+        if now_us >= self.next_transition_time {
+            // Đã đến lúc chuyển trạng thái
+            self.current_state = !self.current_state;
+            
+            // Render trạng thái mới
+            buffer.fill(if self.current_state { self.on } else { self.off });
+            
+            // Tính thời điểm chuyển trạng thái tiếp theo
+            // Thêm nửa chu kỳ vào thời điểm hiện tại
+            let half_cycle = self.cycle_time_us / 2;
+            self.next_transition_time += half_cycle;
+            
+            // Xử lý trường hợp đã bỏ lỡ nhiều transitions (CPU quá bận)
+            // Đảm bảo next_transition_time luôn ở tương lai
+            while self.next_transition_time <= now_us {
+                self.next_transition_time += half_cycle;
+                self.current_state = !self.current_state;
+            }
+            
+            // Trả về thời điểm cần update tiếp theo
+            return Some(self.next_transition_time);
+        }
+        
+        // Chưa đến lúc chuyển, không cần làm gì cả
+        // Nhưng vẫn trả về thời điểm cần update tiếp theo
+        Some(self.next_transition_time)
+    }
+
+    fn set_color(&mut self, color: RGB8) {
+        if self.on != color {
+            self.on = color;
+            // Nếu đang ở trạng thái ON, cần update ngay để thấy màu mới
+            // Set next_transition_time = 0 để trigger update ngay lập tức
+            if self.current_state {
+                self.next_transition_time = 0;
             }
         }
     }
 
-    fn set_color(&mut self, color: RGB8) -> bool {
-        if self.color != color {
-            self.color = color;
-            return true;  // Màu đổi → render lại với màu mới
-        }
-        false
-    }
-
-    fn set_speed(&mut self, speed: u8) -> bool {
-        self.pixel_interval_us = Self::map_speed_to_interval(speed);
-        false
-    }
-}
-
-pub struct CometEffect {
-    color: RGB8,
-    num_leds: usize,
-    position: usize, 
-    tail_len: usize,
-    time_accumulator: u64,
-    pixel_interval_us: u64,
-}
-
-impl CometEffect {
-    pub fn new(color: RGB8, speed: u8, num_leds: usize) -> Self {
-        Self {
-            color,
-            num_leds,
-            position: 0,
-            tail_len: (num_leds / 5).max(3), // Đuôi dài 20% strip, tối thiểu 3
-            time_accumulator: 0,
-            pixel_interval_us: Self::map_speed_to_interval(speed),
-        }
-    }
-
-    // Tốc độ nhanh hơn ColorWipe (max 100ms)
-    fn map_speed_to_interval(speed: u8) -> u64 {
-        let inverted_speed = 256 - speed.max(1) as u64;
-        let interval_ms = (inverted_speed * 100) / 254 + 2; // 2ms - 102ms
-        interval_ms * 1000
-    }
-}
-
-impl Effect for CometEffect {
-    fn name(&self) -> &'static str { "Comet" }
-
-    fn update(&mut self, delta_us: u64) -> bool {
-        self.time_accumulator += delta_us;
-
-        if self.time_accumulator >= self.pixel_interval_us {
-            self.time_accumulator -= self.pixel_interval_us;
+    fn set_speed(&mut self, speed: u8) {
+        let new_speed = speed.clamp(1, 255);
+        if self.speed != new_speed {
+            self.speed = new_speed;
+            let new_cycle_time = cycle_time_us(new_speed);
             
-            // Di chuyển vị trí, lặp lại khi đến cuối
-            self.position = (self.position + 1) % self.num_leds;
-            return true;
-        }
-        false
-    }
-
-    fn render(&self, buffer: &mut [RGB8]) {
-        // 1. Xóa toàn bộ buffer (hoặc làm mờ nếu muốn hiệu ứng mượt hơn)
-        buffer.fill(RGB8::default());
-
-        // 2. Vẽ "đầu" sao chổi
-        buffer[self.position] = self.color;
-
-        // 3. Vẽ "đuôi"
-        for i in 1..=self.tail_len {
-            // Tính vị trí pixel của đuôi (vòng lặp lại)
-            let pos = (self.position + self.num_leds - i) % self.num_leds;
-            
-            // Tính độ mờ (giảm dần)
-            let fade_factor = 255 - (i * (255 / self.tail_len.max(1))) as u8;
-            buffer[pos] = dim_color(self.color, fade_factor);
-        }
-    }
-
-    fn set_color(&mut self, color: RGB8) -> bool {
-        self.color = color;
-        true // Cần render lại ngay
-    }
-
-    fn set_speed(&mut self, speed: u8) -> bool {
-        self.pixel_interval_us = Self::map_speed_to_interval(speed);
-        false
-    }
-}
-
-pub struct ScannerEffect {
-    color: RGB8,
-    num_leds: usize,
-    position: usize, // Vị trí "mắt"
-    direction: i8, // 1 = sang phải, -1 = sang trái
-    time_accumulator: u64,
-    pixel_interval_us: u64,
-}
-
-impl ScannerEffect {
-    pub fn new(color: RGB8, speed: u8, num_leds: usize) -> Self {
-        Self {
-            color,
-            num_leds,
-            position: 0,
-            direction: 1,
-            time_accumulator: 0,
-            pixel_interval_us: Self::map_speed_to_interval(speed),
-        }
-    }
-    
-    // Tốc độ tương tự Comet
-    fn map_speed_to_interval(speed: u8) -> u64 {
-        let inverted_speed = 256 - speed.max(1) as u64;
-        let interval_ms = (inverted_speed * 100) / 254 + 2;
-        interval_ms * 1000
-    }
-}
-
-impl Effect for ScannerEffect {
-    fn name(&self) -> &'static str { "Scanner" }
-
-    fn update(&mut self, delta_us: u64) -> bool {
-        self.time_accumulator += delta_us;
-
-        if self.time_accumulator >= self.pixel_interval_us {
-            self.time_accumulator -= self.pixel_interval_us;
-            
-            // Logic đổi hướng khi chạm 2 đầu
-            if self.direction > 0 {
-                // Đang đi sang phải
-                if self.position >= self.num_leds - 1 {
-                    self.direction = -1; // Đổi hướng
-                }
-            } else {
-                // Đang đi sang trái
-                if self.position <= 0 {
-                    self.direction = 1; // Đổi hướng
-                }
-            }
-            
-            // Di chuyển vị trí
-            self.position = (self.position as i16 + self.direction as i16) as usize;
-            return true;
-        }
-        false
-    }
-
-    fn render(&self, buffer: &mut [RGB8]) {
-        // Xóa buffer
-        buffer.fill(RGB8::default());
-
-        
-        if self.position < self.num_leds {
-            buffer[self.position] = self.color;
-        }
-        
-        
-        let inner_dim = dim_color(self.color, 128); // 50%
-        if self.position >= 1 { buffer[self.position - 1] = inner_dim; }
-        if self.position + 1 < self.num_leds { buffer[self.position + 1] = inner_dim; }
-        
-    
-        let outer_dim = dim_color(self.color, 64); // 25%
-        if self.position >= 2 { buffer[self.position - 2] = outer_dim; }
-        if self.position + 2 < self.num_leds { buffer[self.position + 2] = outer_dim; }
-    }
-
-    fn set_color(&mut self, color: RGB8) -> bool {
-        self.color = color;
-        true
-    }
-
-    fn set_speed(&mut self, speed: u8) -> bool {
-        self.pixel_interval_us = Self::map_speed_to_interval(speed);
-        false
-    }
-}
-
-
-pub struct TheaterChaseEffect {
-    color1: RGB8,
-    color2: RGB8, // Màu nền (thường là đen)
-    num_leds: usize,
-    spacing: usize, // Khoảng cách giữa các pixel sáng
-    position_offset: usize,
-    time_accumulator: u64,
-    pixel_interval_us: u64,
-}
-
-impl TheaterChaseEffect {
-    pub fn new(color: RGB8, speed: u8, num_leds: usize) -> Self {
-        Self {
-            color1: color,
-            color2: RGB8::default(), // Màu đen
-            num_leds,
-            spacing: 4, // Cứ 4 pixel thì sáng 1
-            position_offset: 0,
-            time_accumulator: 0,
-            pixel_interval_us: Self::map_speed_to_interval(speed),
-        }
-    }
-
-    // Tốc độ tương tự Comet
-    fn map_speed_to_interval(speed: u8) -> u64 {
-        let inverted_speed = 256 - speed.max(1) as u64;
-        let interval_ms = (inverted_speed * 100) / 254 + 2;
-        interval_ms * 1000
-    }
-}
-
-impl Effect for TheaterChaseEffect {
-    fn name(&self) -> &'static str { "Theater Chase" }
-
-    fn update(&mut self, delta_us: u64) -> bool {
-        self.time_accumulator += delta_us;
-
-        if self.time_accumulator >= self.pixel_interval_us {
-            self.time_accumulator -= self.pixel_interval_us;
-            
-            // Di chuyển offset, lặp lại theo `spacing`
-            self.position_offset = (self.position_offset + 1) % self.spacing;
-            return true;
-        }
-        false
-    }
-
-    fn render(&self, buffer: &mut [RGB8]) {
-        for (i, pixel) in buffer.iter_mut().enumerate() {
-            // (i + offset) % spacing == 0
-            if (i + self.position_offset) % self.spacing == 0 {
-                *pixel = self.color1;
-            } else {
-                *pixel = self.color2;
+            if new_cycle_time != self.cycle_time_us {
+                self.cycle_time_us = new_cycle_time;
+                // Recalculate next transition với cycle time mới
+                // Để đảm bảo chuyển đổi mượt mà
+                self.next_transition_time = 0; // Trigger recalculation
             }
         }
     }
 
-    fn set_color(&mut self, color: RGB8) -> bool {
-        self.color1 = color;
-        true
+    fn get_color(&self) -> Option<RGB8> {
+        Some(self.on)
     }
 
-    fn set_speed(&mut self, speed: u8) -> bool {
-        self.pixel_interval_us = Self::map_speed_to_interval(speed);
-        false
-    }
-}
-
-
-
-/// Bộ tạo số giả ngẫu nhiên (PRNG) đơn giản
-struct FastRand {
-    seed: u32,
-}
-
-impl FastRand {
-    fn new(seed: u32) -> Self {
-        Self { seed: if seed == 0 { 1 } else { seed } }
-    }
-    
-    /// Trả về một số u32
-    fn rand_u32(&mut self) -> u32 {
-        self.seed = self.seed.wrapping_add(0xADC47F53);
-        let mut tmp = self.seed.wrapping_mul(0x7FFFFFED);
-        tmp ^= tmp >> 15;
-        tmp ^= tmp << 13;
-        tmp
-    }
-    
-    /// Trả về một số u8
-    fn rand_u8(&mut self) -> u8 {
-        (self.rand_u32() >> 24) as u8
+    fn get_speed(&self) -> Option<u8> {
+        Some(self.speed)
     }
 
-    /// Trả về một số trong [0, max)
-    fn rand_max(&mut self, max: usize) -> usize {
-        (self.rand_u32() as u64 * max as u64 / u32::MAX as u64) as usize
+    fn name(&self) -> &str {
+        "Blink"
     }
 }
 
-pub struct TwinkleEffect {
-    base_color: RGB8,    // Màu nền
-    sparkle_color: RGB8, // Màu lấp lánh
+
+
+pub struct VuMeterEffect {
+    // Cấu hình
     num_leds: usize,
-    density: u8, // 1-255: Cơ hội một pixel mới lấp lánh
-    fade_speed: u8, // 1-255: Tốc độ mờ dần
-    time_accumulator: u64,
-    pixel_interval_us: u64,
-    rand: RefCell<FastRand>,
+    speed: u8, // Tốc độ phản ứng với âm thanh (attack/release)
+    
+    // State
+    current_level: f32,         // Mức hiện tại (0.0 - 1.0)
+    peak_level: f32,            // Đỉnh gần đây nhất
+    peak_hold_time: u64,        // Thời gian giữ peak
+    peak_hold_duration_us: u64, // Thời gian giữ peak (microseconds)
+    last_update_time: u64,
+    
+    // FPS control
+    target_frame_time_us: u64,
 }
 
-impl TwinkleEffect {
-    pub fn new(color: RGB8, speed: u8, num_leds: usize) -> Self {
-        // Lấy seed ngẫu nhiên từ thời gian
-        let seed = (unsafe { esp_idf_sys::esp_timer_get_time() } & 0xFFFFFFFF) as u32;
-
-        Self {
-            base_color: RGB8::default(), // Nền đen
-            sparkle_color: color,
-            num_leds,
-            density: 128, // 50% cơ hội
-            fade_speed: 100, // Tốc độ mờ
-            time_accumulator: 0,
-            pixel_interval_us: Self::map_speed_to_interval(speed),
-            rand: RefCell::new(FastRand::new(seed)),
-        }
-    }
-
-    // Tốc độ ở đây là tốc độ "tick" của hiệu ứng
-    fn map_speed_to_interval(speed: u8) -> u64 {
-        let inverted_speed = 256 - speed.max(1) as u64;
-        let interval_ms = (inverted_speed * 50) / 254 + 5; // 5ms - 55ms
-        interval_ms * 1000
-    }
-}
-
-impl Effect for TwinkleEffect {
-    fn name(&self) -> &'static str { "Twinkle" }
-
-    fn update(&mut self, delta_us: u64) -> bool {
-        self.time_accumulator += delta_us;
-
-        // Chỉ update theo tốc độ đã định
-        if self.time_accumulator >= self.pixel_interval_us {
-            self.time_accumulator -= self.pixel_interval_us;
-            return true; // Luôn cần render để xử lý fade
-        }
-        false
-    }
-
-    fn render(&self, buffer: &mut [RGB8]) {
-        // 1. Làm mờ (fade) tất cả các pixel
-        for pixel in buffer.iter_mut() {
-            *pixel = fade_color(*pixel, self.fade_speed);
-        }
-
-        // 2. Thêm các pixel lấp lánh mới
-        let mut rand_mut = self.rand.borrow_mut();
-        if rand_mut.rand_u8() < self.density {
-            // Chọn một vị trí ngẫu nhiên
-            let pos = rand_mut.rand_max(self.num_leds);
-            
-            // Chỉ đặt nếu nó gần như đã tắt (tránh ghi đè pixel đang sáng)
-            if buffer[pos].r < 10 && buffer[pos].g < 10 && buffer[pos].b < 10 {
-                buffer[pos] = self.sparkle_color;
-            }
-        }
+impl VuMeterEffect {
+    pub fn new(num_leds: usize, speed: u8) -> Self {
+        // Target 60 FPS cho sound reactive effect (cần responsive cao)
+        let target_fps = 60;
+        let target_frame_time_us = 1_000_000 / target_fps;
         
-        // (Nếu bạn muốn nhiều pixel hơn, hãy đặt code trên trong một vòng lặp `for`)
-    }
-
-    fn set_color(&mut self, color: RGB8) -> bool {
-        self.sparkle_color = color;
-        false // Không cần render ngay, vòng update sau sẽ dùng màu mới
-    }
-
-    fn set_speed(&mut self, speed: u8) -> bool {
-        self.pixel_interval_us = Self::map_speed_to_interval(speed);
-        false
-    }
-}
-
-fn fade_color(color: RGB8, fade_by: u8) -> RGB8 {
-    RGB8 {
-        r: color.r.saturating_sub(fade_by),
-        g: color.g.saturating_sub(fade_by),
-        b: color.b.saturating_sub(fade_by),
-    }
-}
-
-fn dim_color(color: RGB8, scale: u8) -> RGB8 {
-    RGB8 {
-        r: ((color.r as u16 * scale as u16) >> 8) as u8,
-        g: ((color.g as u16 * scale as u16) >> 8) as u8,
-        b: ((color.b as u16 * scale as u16) >> 8) as u8,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Particle {
-    position: f32, // Vị trí (float)
-    velocity: f32, // Vận tốc (pixel / giây)
-    color: RGB8,
-}
-
-pub struct BounceEffect {
-    num_leds: usize,
-    particles: Vec<Particle>,
-    lut: Vec<RGB8>, // Bảng màu
-    rand: RefCell<FastRand>,
-}
-
-impl BounceEffect {
-    pub fn new(speed: u8, num_leds: usize) -> Self {
-        let seed = (unsafe { esp_idf_sys::esp_timer_get_time() } & 0xFFFFFFFF) as u32;
-        let mut rand = FastRand::new(seed);
-        
-        // Tạo LUT cầu vồng
-        let mut lut = Vec::with_capacity(256);
-        for i in 0..=255 {
-            let hue = (i as f32 * 360.0) / 256.0;
-            let color = Hsv::new(RgbHue::from_degrees(hue), 1.0, 1.0);
-            let srgb: Srgb = Srgb::from_color(color);
-            lut.push(RGB8 {
-                r: (srgb.red * 255.0).round() as u8,
-                g: (srgb.green * 255.0).round() as u8,
-                b: (srgb.blue * 255.0).round() as u8,
-            });
-        }
-
-        // Tạo các hạt
-        let num_particles = (num_leds / 20).max(3); // 5% dải LED, tối thiểu 3
-        let mut particles = Vec::with_capacity(num_particles);
-        
-        // Ánh xạ speed (1-255) sang vận tốc (10-60 pixels/sec)
-        let max_vel = (speed as f32 / 255.0) * 50.0 + 10.0;
-
-        for _ in 0..num_particles {
-            // Vận tốc ngẫu nhiên (có thể âm hoặc dương)
-            let vel = (rand.rand_u32() as f32 / u32::MAX as f32 - 0.5) * 2.0 * max_vel;
-            
-            particles.push(Particle {
-                position: rand.rand_max(num_leds) as f32,
-                velocity: vel.clamp(-max_vel, max_vel),
-                color: lut[rand.rand_u8() as usize],
-            });
-        }
-
         Self {
             num_leds,
-            particles,
-            lut,
-            rand: RefCell::new(rand),
-        }
-    }
-    
-    // Hàm này sẽ được dùng trong set_speed
-    fn update_speeds(&mut self, speed: u8) {
-        let max_vel = (speed as f32 / 255.0) * 50.0 + 10.0;
-        let mut rand = self.rand.borrow_mut();
-        
-        for p in self.particles.iter_mut() {
-            let vel = (rand.rand_u32() as f32 / u32::MAX as f32 - 0.5) * 2.0 * max_vel;
-            p.velocity = vel.clamp(-max_vel, max_vel);
-        }
-    }
-}
-
-impl Effect for BounceEffect {
-    fn name(&self) -> &'static str { "Bounce" }
-
-    fn update(&mut self, delta_us: u64) -> bool {
-        // Chuyển delta_us sang giây (dưới dạng f32)
-        let delta_sec = (delta_us as f32) / 1_000_000.0;
-        let max_pos = (self.num_leds - 1) as f32;
-
-        for p in self.particles.iter_mut() {
-            // Tính vị trí mới
-            let mut new_pos = p.position + p.velocity * delta_sec;
-
-            // Kiểm tra va chạm
-            if new_pos < 0.0 {
-                new_pos = 0.0; // Đặt lại vị trí
-                p.velocity = -p.velocity; // Đảo chiều
-            } else if new_pos > max_pos {
-                new_pos = max_pos; // Đặt lại vị trí
-                p.velocity = -p.velocity; // Đảo chiều
-            }
-            
-            p.position = new_pos;
-        }
-
-        true // Luôn luôn render
-    }
-
-    fn render(&self, buffer: &mut [RGB8]) {
-        // 1. Xóa buffer
-        buffer.fill(RGB8::default());
-
-        // 2. Vẽ từng hạt
-        for p in &self.particles {
-            let pos_int = p.position.round() as usize;
-            if pos_int < buffer.len() {
-                // Thêm màu (additive) để các hạt giao nhau đẹp hơn
-                buffer[pos_int].r = buffer[pos_int].r.saturating_add(p.color.r);
-                buffer[pos_int].g = buffer[pos_int].g.saturating_add(p.color.g);
-                buffer[pos_int].b = buffer[pos_int].b.saturating_add(p.color.b);
-            }
-        }
-    }
-
-    fn set_color(&mut self, _color: RGB8) -> bool {
-        // Hiệu ứng này không dùng 1 màu
-        false
-    }
-
-    fn set_speed(&mut self, speed: u8) -> bool {
-        // Tính toán lại tất cả vận tốc
-        self.update_speeds(speed);
-        false
-    }
-}
-
-pub struct AudioVolumeBarEffect {
-    color: RGB8,
-    num_leds: usize,
-    center: usize,
-    
-    // Peak hold system (for both sides)
-    peak_hold_left: usize,
-    peak_hold_right: usize,
-    peak_hold_time: u64,
-    last_peak_update: u64,
-    
-    // Smoothing for natural movement
-    current_level: f32,
-    smooth_factor: f32,
-    
-    // Idle animation
-    idle_phase: f32,
-    idle_speed: f32,
-    idle_amplitude: f32,
-    
-    // Background brightness
-    bg_brightness: u8,
-}
-
-impl AudioVolumeBarEffect {
-    pub fn new(color: RGB8, num_leds: usize) -> Self {
-        Self {
-            color,
-            num_leds,
-            center: num_leds / 2,
-            peak_hold_left: num_leds / 2,
-            peak_hold_right: num_leds / 2,
-            peak_hold_time: 500_000, // 500ms
-            last_peak_update: 0,
+            speed: speed.clamp(1, 255),
             current_level: 0.0,
-            smooth_factor: 0.2,
-            idle_phase: 0.0,
-            idle_speed: 2.0,
-            idle_amplitude: 0.15, // 15% breathing when idle
-            bg_brightness: 20, // White background at 20/255 brightness
+            peak_level: 0.0,
+            peak_hold_time: 0,
+            peak_hold_duration_us: 500_000, // Giữ peak trong 0.5 giây
+            last_update_time: 0,
+            target_frame_time_us,
+        }
+    }
+    
+    /// Tính hệ số smoothing dựa trên speed
+    fn smoothing_factor(&self) -> (f32, f32) {
+        // Speed càng cao, phản ứng càng nhanh (smoothing thấp)
+        // Attack (tăng) nhanh hơn release (giảm) để có cảm giác punchy
+        let base_attack = 0.3;   // Attack nhanh
+        let base_release = 0.1;  // Release chậm hơn
+        
+        let speed_factor = self.speed as f32 / 255.0;
+        
+        let attack = base_attack + speed_factor * 0.4;   // 0.3 - 0.7
+        let release = base_release + speed_factor * 0.2; // 0.1 - 0.3
+        
+        (attack, release)
+    }
+    
+    /// Chuyển đổi level (0-1) sang màu gradient
+    /// Xanh lá (thấp) -> Vàng (trung bình) -> Đỏ (cao)
+    fn level_to_color(&self, normalized_position: f32) -> RGB8 {
+        if normalized_position < 0.33 {
+            // Vùng xanh lá (thấp)
+            let t = normalized_position / 0.33;
+            RGB8 {
+                r: 0,
+                g: (255.0 * t) as u8,
+                b: 0,
+            }
+        } else if normalized_position < 0.66 {
+            // Chuyển từ xanh lá sang vàng
+            let t = (normalized_position - 0.33) / 0.33;
+            RGB8 {
+                r: (255.0 * t) as u8,
+                g: 255,
+                b: 0,
+            }
+        } else {
+            // Chuyển từ vàng sang đỏ
+            let t = (normalized_position - 0.66) / 0.34;
+            RGB8 {
+                r: 255,
+                g: (255.0 * (1.0 - t)) as u8,
+                b: 0,
+            }
         }
     }
 }
 
-impl Effect for AudioVolumeBarEffect {
-    fn name(&self) -> &'static str { "Audio Volume Bar" }
-
-    fn update(&mut self, _delta_us: u64) -> bool {
-        true
+impl Effect for VuMeterEffect {
+    fn update(&mut self, _now_us: u64, _buffer: &mut [RGB8]) -> Option<u64> {
+        None
     }
-
-    fn render(&self, buffer: &mut [RGB8]) {
-        buffer.fill(RGB8::default());
-    }
-    
-    fn render_audio(&mut self, buffer: &mut [RGB8], audio: &AudioData, now_us: u64) {
-        // Step 1: Fill background with dim white
-        let bg_color = RGB8 {
-            r: self.bg_brightness,
-            g: self.bg_brightness,
-            b: self.bg_brightness,
-        };
-        buffer.fill(bg_color);
-        
-        // Step 2: Update breathing phase for idle animation
-        let delta_sec = 0.033; // ~30 FPS
-        self.idle_phase += delta_sec * self.idle_speed;
-        if self.idle_phase > core::f32::consts::PI * 2.0 {
-            self.idle_phase -= core::f32::consts::PI * 2.0;
+    fn update_audio(&mut self, now_us: u64, audio: &AudioData, buffer: &mut [RGB8]) -> Option<u64> {
+        // Khởi tạo lần đầu
+        if self.last_update_time == 0 {
+            self.last_update_time = now_us;
         }
         
-        let breath = self.idle_phase.sin() * 0.5 + 0.5; // 0.0 to 1.0
+        // Lấy biên độ âm thanh từ audio.volume
+        // AudioData của bạn đã có volume (0.0 - 1.0) với noise gate và smoothing
+        let target_level = audio.volume.clamp(0.0, 1.0);
         
-        // Step 3: Calculate spread level
-        let has_audio = audio.volume > 0.02;
-        
-        let spread: f32 = if has_audio {
-            // Smooth audio response with subtle breathing
-            let target = audio.volume;
-            self.current_level += (target - self.current_level) * self.smooth_factor;
-            self.current_level * 0.9 + breath * 0.1
+        // Smooth transition sử dụng exponential moving average
+        let (attack, release) = self.smoothing_factor();
+        let smoothing = if target_level > self.current_level {
+            attack  // Attack: tăng nhanh
         } else {
-            // Idle breathing animation
-            self.current_level *= 0.95; // Decay
-            self.idle_amplitude * breath
+            release // Release: giảm chậm
         };
         
-        // Step 4: Calculate LEDs to light from center
-        let half_spread = ((spread * (self.num_leds / 2) as f32) as usize).min(self.num_leds / 2);
+        self.current_level = self.current_level * (1.0 - smoothing) + target_level * smoothing;
         
-        // Step 5: Render user color from center spreading out
-        // Left side
-        for i in 0..half_spread {
-            let pos = self.center.saturating_sub(i + 1);
-            if pos < self.num_leds {
-                buffer[pos] = self.color;
+        // Xử lý peak hold
+        if self.current_level > self.peak_level {
+            // Level mới cao hơn peak, cập nhật peak
+            self.peak_level = self.current_level;
+            self.peak_hold_time = now_us;
+        } else if now_us - self.peak_hold_time > self.peak_hold_duration_us {
+            // Đã giữ peak đủ lâu, để peak rơi xuống
+            self.peak_level = self.current_level;
+        }
+        
+        // Tính số LED cần sáng dựa trên level
+        let num_lit = (self.current_level * self.num_leds as f32) as usize;
+        let peak_position = (self.peak_level * self.num_leds as f32) as usize;
+        
+        // Render VU meter vào buffer
+        // Bottom-up: LED ở index 0 là dưới cùng, index max là trên cùng
+        for (i, pixel) in buffer.iter_mut().enumerate() {
+            if i < num_lit {
+                // LED này nằm trong vùng sáng, tính màu gradient
+                let position = i as f32 / self.num_leds as f32;
+                *pixel = self.level_to_color(position);
+            } else if i == peak_position {
+                // LED này là peak, sáng màu trắng/cyan để nổi bật
+                *pixel = RGB8 { r: 0, g: 255, b: 255 };
+            } else {
+                // LED này tắt
+                *pixel = RGB8 { r: 0, g: 0, b: 0 };
             }
         }
         
-        // Right side
-        for i in 0..half_spread {
-            let pos = self.center + i + 1;
-            if pos < self.num_leds {
-                buffer[pos] = self.color;
-            }
-        }
+        self.last_update_time = now_us;
         
-        // Center LED (always user color when active)
-        if spread > 0.01 {
-            buffer[self.center] = self.color;
-        }
-        
-        // Step 6: Peak hold system (only when audio active)
-        if has_audio {
-            let left_peak_pos = self.center.saturating_sub(half_spread);
-            let right_peak_pos = (self.center + half_spread).min(self.num_leds - 1);
-            
-            // Update peaks
-            if left_peak_pos < self.peak_hold_left {
-                self.peak_hold_left = left_peak_pos;
-                self.last_peak_update = now_us;
-            }
-            if right_peak_pos > self.peak_hold_right {
-                self.peak_hold_right = right_peak_pos;
-                self.last_peak_update = now_us;
-            }
-            
-            // Peak decay
-            if now_us - self.last_peak_update > self.peak_hold_time {
-                if self.peak_hold_left < self.center {
-                    self.peak_hold_left += 1;
-                }
-                if self.peak_hold_right > self.center {
-                    self.peak_hold_right = self.peak_hold_right.saturating_sub(1);
-                }
-                self.last_peak_update = now_us;
-            }
-            
-            // Render peak markers (brighter version of user color)
-            if self.peak_hold_left < self.center && self.peak_hold_left < self.num_leds {
-                buffer[self.peak_hold_left] = RGB8 {
-                    r: self.color.r.saturating_add(50).min(255),
-                    g: self.color.g.saturating_add(50).min(255),
-                    b: self.color.b.saturating_add(50).min(255),
-                };
-            }
-            if self.peak_hold_right > self.center && self.peak_hold_right < self.num_leds {
-                buffer[self.peak_hold_right] = RGB8 {
-                    r: self.color.r.saturating_add(50).min(255),
-                    g: self.color.g.saturating_add(50).min(255),
-                    b: self.color.b.saturating_add(50).min(255),
-                };
-            }
-        } else {
-            // Reset peaks when idle
-            self.peak_hold_left = self.center;
-            self.peak_hold_right = self.center;
-        }
+        // Trả về thời điểm update tiếp theo (60 FPS cho sound reactive)
+        Some(now_us + self.target_frame_time_us)
     }
 
-    fn set_color(&mut self, color: RGB8) -> bool {
-        self.color = color;
-        true // Need re-render with new color
+    fn is_audio_reactive(&self) -> bool {
+        true // Đây là effect phản ứng với âm thanh
     }
-    
-    fn is_audio_reactive(&self) -> bool { 
-        true 
+
+    fn set_speed(&mut self, speed: u8) {
+        self.speed = speed.clamp(1, 255);
+    }
+
+    fn get_speed(&self) -> Option<u8> {
+        Some(self.speed)
+    }
+
+    fn name(&self) -> &str {
+        "VU Meter"
     }
 }
