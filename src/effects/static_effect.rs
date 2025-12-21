@@ -3,31 +3,36 @@
 use smart_leds::RGB8;
 use super::Effect;
 
-/// Static Effect - Hiển thị một màu tĩnh
-/// 
-/// Effect đơn giản nhất, chỉ render một lần rồi không update nữa
-/// cho đến khi màu được thay đổi. Rất tiết kiệm CPU.
 pub struct StaticEffect {
     color: RGB8,
+    dirty: bool,
 }
 
 impl StaticEffect {
     pub fn new(color: RGB8) -> Self {
-        Self { color }
+        Self { 
+            color,
+            dirty: true 
+        }
     }
 }
 
 impl Effect for StaticEffect {
     fn update(&mut self, _now_us: u64, buffer: &mut [RGB8]) -> Option<u64> {
-        // Đơn giản: luôn fill buffer
+        if !self.dirty {
+            return None;
+        }
+
         buffer.fill(self.color);
-        
-        // Không cần update tự động nữa
-        None
+        self.dirty = false;
+        Some(0) 
     }
 
     fn set_color(&mut self, color: RGB8) {
-        self.color = color;
+        if self.color != color {
+            self.color = color;
+            self.dirty = true; 
+        }
     }
 
     fn get_color(&self) -> Option<RGB8> {

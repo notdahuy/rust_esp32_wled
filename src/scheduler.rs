@@ -1,5 +1,6 @@
-use log::{info};
-use crate::effect::EffectType;
+
+use log::info;
+use crate::effects::EffectType;
 use smart_leds::RGB8;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,29 +23,60 @@ impl TimeOfDay {
 }
 
 #[derive(Debug, Clone)]
-pub struct ScheduleAction {
-    pub power_on: bool,              // true = bật, false = tắt
-    pub effect: Option<EffectType>,  // Hiệu ứng khi bật (None nếu chỉ tắt)
-    pub color: Option<RGB8>,         // Màu cho hiệu ứng (nếu cần)
-    pub brightness: Option<f32>,     // Độ sáng (0.0-1.0)
-    pub speed: Option<u8>,           // Tốc độ hiệu ứng
+pub struct SchedulePreset {
+    pub effect: EffectType,     // Hiệu ứng (tắt = Static)
+    pub color: Option<RGB8>,    // Màu (tắt = Some(RGB8 { r: 0, g: 0, b: 0 }))
+    pub brightness: Option<f32>, // Độ sáng
+    pub speed: Option<u8>,      // Tốc độ
 }
 
-impl ScheduleAction {
-    pub fn power_off() -> Self {
+impl SchedulePreset {
+    pub fn new(effect: EffectType) -> Self {
         Self {
-            power_on: false,
-            effect: None,
+            effect,
             color: None,
             brightness: None,
             speed: None,
         }
     }
     
-    pub fn full(power_on: bool, effect: Option<EffectType>, color: Option<RGB8>, 
-                brightness: Option<f32>, speed: Option<u8>) -> Self {
+    pub fn with_color(effect: EffectType, color: RGB8) -> Self {
         Self {
-            power_on,
+            effect,
+            color: Some(color),
+            brightness: None,
+            speed: None,
+        }
+    }
+    
+    pub fn with_all(effect: EffectType, color: Option<RGB8>, brightness: Option<f32>, speed: Option<u8>) -> Self {
+        Self {
+            effect,
+            color,
+            brightness,
+            speed,
+        }
+    }
+    
+    // Tạo preset tắt (static màu đen)
+    pub fn off() -> Self {
+        Self {
+            effect: EffectType::Static,
+            color: Some(RGB8 { r: 0, g: 0, b: 0 }),
+            brightness: None,
+            speed: None,
+        }
+    }
+    
+    // Kiểm tra có phải preset tắt không
+    pub fn is_off(&self) -> bool {
+        self.effect == EffectType::Static && 
+        self.color == Some(RGB8 { r: 0, g: 0, b: 0 })
+    }
+    
+    // Tạo preset bật với effect cụ thể
+    pub fn on(effect: EffectType, color: Option<RGB8>, brightness: Option<f32>, speed: Option<u8>) -> Self {
+        Self {
             effect,
             color,
             brightness,
@@ -57,13 +89,12 @@ impl ScheduleAction {
 pub struct Schedule {
     pub id: usize,
     pub enabled: bool,
-    pub action: ScheduleAction,
+    pub preset: SchedulePreset,
     pub time: TimeOfDay,
     pub days: [bool; 7],        // Mon=0, Tue=1, ..., Sun=6
 }
 
 impl Schedule {
-   
     pub fn should_trigger(&self, current_time: TimeOfDay, current_day: u8) -> bool {
         if !self.enabled {
             return false;
@@ -84,43 +115,44 @@ impl Schedule {
     
     pub fn days_string(&self) -> heapless::String<32> {
         let mut s = heapless::String::new();
-        let day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-        let mut first = true;
+        
+        // Array chứa các số dạng string
+        const DAY_STRS: [&str; 7] = ["0", "1", "2", "3", "4", "5", "6"];
         
         for (i, &enabled) in self.days.iter().enumerate() {
             if enabled {
-                if !first {
+                if !s.is_empty() {
                     let _ = s.push_str(",");
                 }
-                let _ = s.push_str(day_names[i]);
-                first = false;
+                let _ = s.push_str(DAY_STRS[i]);
             }
-        }
-        
-        if s.is_empty() {
-            let _ = s.push_str("None");
         }
         
         s
     }
     
     pub fn effect_string(&self) -> &'static str {
-        if !self.action.power_on {
-            return "OFF";
+        if self.preset.is_off() {
+            return "off";
         }
         
-        match &self.action.effect {
-            Some(EffectType::Static) => "static",
-            Some(EffectType::Rainbow) => "rainbow",
-            Some(EffectType::Breathe) => "breathe",
-            Some(EffectType::ColorWipe) => "colorwipe",
-            Some(EffectType::Comet) => "comet",
-            Some(EffectType::Scanner) => "scanner",
-            Some(EffectType::TheaterChase) => "theaterchase",
-            Some(EffectType::Bounce) => "bounce",
-            Some(EffectType::AudioVolumeBar) => "volumebar",
-            None => "ON",
+        match self.preset.effect {
+            EffectType::Static => "static",
+            EffectType::Rainbow => "rainbow",
+            EffectType::Breathe => "breathe",
+            EffectType::Comet => "comet",
+            EffectType::VuMeter => "vumeter",
+            EffectType::Scanner => "scanner",
+            EffectType::TheaterChase => "theaterchase",
+            EffectType::Bounce => "bounce",
+            EffectType::ColorWipe => "colorwipe",
+            EffectType::Gravimeter => "gravimeter",
+            EffectType::RadialPulseEffect => "pulse",
         }
+    }
+    
+    pub fn is_off(&self) -> bool {
+        self.preset.is_off()
     }
 }
 
@@ -128,7 +160,6 @@ pub struct LedScheduler {
     schedules: heapless::Vec<Schedule, 16>,  // Max 16 schedules
     next_id: usize,
     last_check_minute: u16,  // Track last checked minute to avoid duplicate triggers
-    led_state: bool,
 }
 
 impl LedScheduler {
@@ -137,28 +168,24 @@ impl LedScheduler {
             schedules: heapless::Vec::new(),
             next_id: 0,
             last_check_minute: 0xFFFF,
-            led_state: true,
         }
     }
     
-    pub fn add_schedule(&mut self, action: ScheduleAction, time: TimeOfDay, days: [bool; 7]) -> Result<usize, &'static str> {
+    pub fn add_schedule(&mut self, preset: SchedulePreset, time: TimeOfDay, days: [bool; 7]) -> Result<usize, &'static str> {
         let id = self.next_id;
         self.next_id += 1;
         
         let schedule = Schedule {
             id,
             enabled: true,
-            action: action.clone(),
+            preset: preset.clone(),
             time,
             days,
         };
         
         self.schedules.push(schedule)
             .map_err(|_| "Schedule list full (max 16)")?;
-        
-        info!("Schedule {} added: {} at {:02}:{:02}", 
-              id, if action.power_on { "ON" } else { "OFF" }, time.hour, time.minute);
-        
+            
         Ok(id)
     }
     
@@ -171,13 +198,23 @@ impl LedScheduler {
             false
         }
     }
+    
+    pub fn toggle_schedule(&mut self, id: usize, enable: bool) -> bool {
+        if let Some(schedule) = self.schedules.iter_mut().find(|s| s.id == id) {
+            schedule.enabled = enable;
+            info!("Schedule {} {}", id, if enable { "enabled" } else { "disabled" });
+            true
+        } else {
+            false
+        }
+    }
   
     pub fn clear_all(&mut self) {
         self.schedules.clear();
         info!("All schedules cleared");
     }
     
-    pub fn check_and_execute(&mut self, current_time: TimeOfDay, current_day: u8) -> Option<ScheduleAction> {
+    pub fn check_and_execute(&mut self, current_time: TimeOfDay, current_day: u8) -> Option<SchedulePreset> {
         let current_minute = current_time.to_minutes();
         
         // Only check once per minute
@@ -189,13 +226,13 @@ impl LedScheduler {
         // Check all schedules
         for schedule in self.schedules.iter() {
             if schedule.should_trigger(current_time, current_day) {
-                self.led_state = schedule.action.power_on;
-                let action = schedule.action.clone();  // Clone action
-                info!("Schedule {} triggered: LED {} - Effect: {}", 
+                let preset = schedule.preset.clone();
+                info!("Schedule {} triggered: {} at {:02}:{:02}", 
                       schedule.id, 
-                      if action.power_on { "ON" } else { "OFF" },
-                      schedule.effect_string());
-                return Some(action);
+                      if schedule.is_off() { "OFF" } else { schedule.effect_string() },
+                      schedule.time.hour, 
+                      schedule.time.minute);
+                return Some(preset);
             }
         }
         
@@ -204,9 +241,5 @@ impl LedScheduler {
     
     pub fn get_all_schedules(&self) -> &[Schedule] {
         &self.schedules
-    }
-    
-    pub fn set_led_state(&mut self, state: bool) {
-        self.led_state = state;
     }
 }
