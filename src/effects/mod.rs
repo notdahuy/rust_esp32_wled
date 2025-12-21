@@ -69,6 +69,7 @@ pub static EFFECT_REGISTRY: Lazy<HashMap<&'static str, EffectType>> = Lazy::new(
     m
 });
 
+// Trait chung cho tất cả effect
 pub trait Effect {
     fn update(&mut self, now_us: u64, buffer: &mut [RGB8]) -> Option<u64>;
     fn set_color(&mut self, _color: RGB8) {}

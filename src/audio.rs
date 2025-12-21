@@ -38,16 +38,19 @@ impl Default for AudioData {
     }
 }
 
+// Làm mượt sự thay đổi giá trị theo thời gian (tương tự Low-pass filter)
 #[inline(always)]
 fn smooth(current: f32, target: f32, factor: f32) -> f32 {
     current * factor + target * (1.0 - factor)
 }
 
+// Giới hạn giá trị nằm trong khoảng từ 0.0 đến 1.0
 #[inline(always)]
 fn clamp(v: f32) -> f32 {
     v.clamp(0.0, 1.0)
 }
 
+// Loại bỏ các tín hiệu nhiễu nhỏ dưới ngưỡng cho phép (Noise Gate)
 #[inline(always)]
 fn apply_noise_gate(value: f32, threshold: f32) -> f32 {
     if value < threshold {
@@ -57,6 +60,7 @@ fn apply_noise_gate(value: f32, threshold: f32) -> f32 {
     }
 }
 
+// Tính giá trị hiệu dụng (RMS) để đo cường độ/âm lượng tổng thể của mẫu âm thanh
 #[inline]
 fn calculate_rms(samples: &[i32]) -> f32 {
     if samples.is_empty() { return 0.0; }
@@ -71,7 +75,7 @@ fn calculate_rms(samples: &[i32]) -> f32 {
     (mean_square.sqrt()) / (i32::MAX as f32)
 }
 
-
+// Tính tỷ lệ qua điểm 0 (Zero Crossing Rate) để ước lượng tần số cơ bản
 #[inline]
 fn calculate_zcr(samples: &[i32]) -> f32 {
     let mut crossings = 0u32;
@@ -87,6 +91,7 @@ fn calculate_zcr(samples: &[i32]) -> f32 {
     (crossings as f32) / (samples.len() as f32)
 }
 
+// Đánh giá năng lượng tần số cao dựa trên sự thay đổi đột ngột giữa các mẫu liền kề
 #[inline]
 fn calculate_spectral_brightness(samples: &[i32], rms: f32) -> f32 {
     if rms < 0.005 {  
@@ -115,6 +120,7 @@ fn calculate_spectral_brightness(samples: &[i32], rms: f32) -> f32 {
     }
 }
 
+// Phân tích và tách tín hiệu thành 3 dải: Bass, Mid, Treble dựa trên RMS và ZCR
 fn analyze_frequency_bands(samples: &[i32]) -> (f32, f32, f32) {
     let rms = calculate_rms(samples);
 
@@ -145,6 +151,7 @@ fn analyze_frequency_bands(samples: &[i32]) -> (f32, f32, f32) {
     (bass, mid, treble)
 }
 
+// Chia nhỏ mẫu âm thanh thành các đoạn để giả lập các cột sóng (Spectrum/Visualizer)
 fn generate_simple_bins(samples: &[i32], bins: &mut [f32; NUM_BINS]) {
     let chunk_size = BUFFER_SIZE / NUM_BINS;
     
@@ -180,6 +187,7 @@ fn generate_simple_bins(samples: &[i32], bins: &mut [f32; NUM_BINS]) {
     }
 }
 
+// Phát hiện điểm nhấn (Beat/Peak) dựa trên sự tăng vọt năng lượng so với trung bình quá khứ
 #[inline]
 fn detect_peak(current: f32, history: &[f32; 8]) -> f32 {
     let avg: f32 = history.iter().sum::<f32>() / history.len() as f32;
@@ -192,6 +200,7 @@ fn detect_peak(current: f32, history: &[f32; 8]) -> f32 {
     }
 }
 
+// Loại bỏ thành phần một chiều (DC Offset) để cân bằng tín hiệu về trục 0
 fn remove_dc_offset(samples: &mut [i32]) {
     let mut sum: i64 = 0;
     for &s in samples.iter() {
@@ -204,6 +213,7 @@ fn remove_dc_offset(samples: &mut [i32]) {
     }
 }
 
+// Task chính xử lý âm thanh: Cấu hình I2S, đọc dữ liệu mic, phân tích và cập nhật vào AudioData
 pub fn audio_processing_blocking(
     i2s: I2S0,
     sck: Gpio33,
